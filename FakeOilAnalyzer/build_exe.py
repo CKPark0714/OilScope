@@ -28,6 +28,14 @@ import shutil
 import subprocess
 import sys
 
+# Windows 콘솔의 기본 코드페이지(cp1252 등)는 한글을 인코딩하지 못해, 아래
+# print()의 한글 메시지가 UnicodeEncodeError로 스크립트를 죽일 수 있다.
+# (영어 로캘의 Windows에서 특히 잘 발생한다.) stdout/stderr를 UTF-8로
+# 강제 재설정해 어떤 시스템 로캘에서도 안전하게 출력되도록 한다.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 ENTRY_SCRIPT = os.path.join(PROJECT_ROOT, "gui_main.py")
