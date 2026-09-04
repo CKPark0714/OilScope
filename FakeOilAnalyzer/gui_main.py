@@ -21,7 +21,6 @@ gui_main.py
 
 from __future__ import annotations
 
-import json
 import os
 import sys
 from typing import Optional
@@ -33,7 +32,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QTabWidget, QVBoxLayout, QHBoxLayout,
     QFormLayout, QGroupBox, QLabel, QLineEdit, QPushButton, QFileDialog,
     QSlider, QDoubleSpinBox, QTableWidget, QTableWidgetItem, QMessageBox,
-    QHeaderView, QSplitter, QComboBox, QDialog, QListWidget,
+    QHeaderView, QSplitter, QDialog,
 )
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
@@ -61,9 +60,10 @@ _setup_korean_font()
 from data_parser import GCDataParser, GCWaveform
 from analyzer import (
     FuelProperties, FuelSample, FuelBlendingSimulator, MixRatioEstimator,
-    RawMaterialCandidate, deconvolve_raw_waveform, estimate_unknown_raw_properties,
-    search_similar_raw_materials, mix_properties, estimate_a_from_all_properties,
+    deconvolve_raw_waveform, estimate_unknown_raw_properties,
+    match_fake_against_candidates,
 )
+from raw_material_db import RawMaterialDatabase, RawMaterialRecord, seed_example_records
 
 
 # ---------------------------------------------------------------------------
@@ -421,6 +421,296 @@ class Case1Tab(QWidget):
 
 
 # ---------------------------------------------------------------------------
+# 원료 후보 DB 관리: 추가/편집 폼 + 목록 다이얼로그
+# ---------------------------------------------------------------------------
+class RawMaterialRecordEditor(QDialog):
+    """원료 후보 1건 추가/편집용 폼 다이얼로그.
+
+    GC 크로마토그램은 파일 선택 버튼 또는 드래그앤드롭(FilePickerRow 재사용)으로
+    받고, 유종/시료번호/식별제·밀도·동점도/비고를 함께 입력받는다.
+    """
+
+    def __init__(self, parser: GCDataParser, record: Optional[RawMaterialRecord] = None, parent=None):
+        super().__init__(parent)
+        self.parser = parser
+        self.setWindowTitle("원료 후보 편집" if record else "원료 후보 추가")
+        self.resize(480, 460)
+
+        self._record_id: Optional[str] = record.id if record else None
+        self._new_wf: Optional[GCWaveform] = None       # 새로 선택된 크로마토그램 (원본, 베이스라인 보정만 적용)
+        self._existing_wave = None                       # 기존 레코드의 (time, intensity, source_filename)
+        self.result_record: Optional[RawMaterialRecord] = None
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.name_edit = QLineEdit()
+        self.oil_type_edit = QLineEdit()
+        self.sample_no_edit = QLineEdit()
+        self.notes_edit = QLineEdit()
+        form.addRow("원료명:", self.name_edit)
+        form.addRow("유종:", self.oil_type_edit)
+        form.addRow("시료번호:", self.sample_no_edit)
+        form.addRow("비고(기타 시험값):", self.notes_edit)
+        layout.addLayout(form)
+
+        self.props_group = PropertyInputGroup("물성치")
+        layout.addWidget(self.props_group)
+
+        file_group = QGroupBox("크로마토그램 (드래그앤드롭 또는 파일 선택)")
+        file_layout = QVBoxLayout(file_group)
+        self.file_row = FilePickerRow("GC 파일:", color="red")
+        self.file_row.file_selected.connect(self._on_file_selected)
+        file_layout.addWidget(self.file_row)
+        self.file_status_label = QLabel("파일 없음")
+        self.file_status_label.setStyleSheet("color: gray; font-size: 10px;")
+        self.file_status_label.setWordWrap(True)
+        file_layout.addWidget(self.file_status_label)
+        layout.addWidget(file_group)
+
+        if record:
+            self.name_edit.setText(record.name)
+            self.oil_type_edit.setText(record.oil_type)
+            self.sample_no_edit.setText(record.sample_no)
+            self.notes_edit.setText(record.notes)
+            self.props_group.set_properties(record.properties)
+            if record.has_waveform():
+                self._existing_wave = (record.time, record.intensity, record.source_filename)
+                self.file_status_label.setText(
+                    f"기존 크로마토그램 사용 중 ({record.source_filename or '알 수 없음'}, "
+                    f"{len(record.time)}포인트) — 새 파일을 선택하면 교체됩니다.")
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        cancel_btn = QPushButton("취소")
+        cancel_btn.clicked.connect(self.reject)
+        save_btn = QPushButton("저장")
+        save_btn.clicked.connect(self._on_save)
+        btn_row.addWidget(cancel_btn)
+        btn_row.addWidget(save_btn)
+        layout.addLayout(btn_row)
+
+    def preload_file(self, path: str):
+        """드래그앤드롭으로 다이얼로그 자체에 파일이 떨어졌을 때 미리 채워넣기 위한 진입점."""
+        self.file_row.path_edit.setText(path)
+        self._on_file_selected(path)
+
+    def _on_file_selected(self, path: str):
+        try:
+            wf = self.parser.load_file(path)
+            wf = self.parser.correct_baseline(wf)
+            self._new_wf = wf
+            self.file_status_label.setText(f"'{os.path.basename(path)}' 로드됨 ({len(wf.time)}포인트)")
+            if not self.name_edit.text().strip():
+                self.name_edit.setText(os.path.splitext(os.path.basename(path))[0])
+        except Exception as e:
+            QMessageBox.critical(self, "로드 오류", f"크로마토그램 로드 중 오류:\n{e}")
+            self._new_wf = None
+
+    def _on_save(self):
+        name = self.name_edit.text().strip()
+        if not name:
+            QMessageBox.warning(self, "입력 오류", "원료명을 입력해주세요.")
+            return
+
+        if self._new_wf is not None:
+            time_list = self._new_wf.time.tolist()
+            intensity_list = self._new_wf.intensity.tolist()
+            source_filename = os.path.basename(self._new_wf.source_path or "")
+        elif self._existing_wave is not None:
+            time_list, intensity_list, source_filename = self._existing_wave
+        else:
+            QMessageBox.warning(self, "입력 오류", "크로마토그램 파일을 선택해주세요.")
+            return
+
+        props = self.props_group.get_properties()
+        kwargs = dict(
+            name=name,
+            oil_type=self.oil_type_edit.text().strip(),
+            sample_no=self.sample_no_edit.text().strip(),
+            marker_conc=props.marker_conc,
+            density=props.density,
+            viscosity=props.viscosity,
+            notes=self.notes_edit.text().strip(),
+            source_filename=source_filename,
+            time=time_list,
+            intensity=intensity_list,
+        )
+        if self._record_id:
+            kwargs["id"] = self._record_id
+        self.result_record = RawMaterialRecord(**kwargs)
+        self.accept()
+
+
+class RawMaterialDBDialog(QDialog):
+    """원료 후보 DB 관리 창: 목록 조회, 추가/편집/삭제, 드래그앤드롭 업로드,
+    JSON 가져오기/내보내기를 제공한다."""
+
+    db_changed = Signal()
+
+    def __init__(self, db: RawMaterialDatabase, parser: GCDataParser, parent=None):
+        super().__init__(parent)
+        self.db = db
+        self.parser = parser
+        self.setWindowTitle("원료 후보 DB 관리")
+        self.resize(780, 480)
+        self.setAcceptDrops(True)
+
+        layout = QVBoxLayout(self)
+
+        hint = QLabel(
+            "GC 크로마토그램 파일을 이 창으로 드래그앤드롭하면 새 원료 후보 추가 창이 열립니다.\n"
+            "※ 이름이 '[예시]'로 시작하는 항목은 최초 실행 시 자동 생성된 참고용 데이터입니다. "
+            "'편집'으로 실제 유종/시료번호/시험값을 채우거나 '삭제' 후 실제 데이터를 추가하세요."
+        )
+        hint.setStyleSheet("color: gray; font-size: 10px;")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(
+            ["원료명", "유종", "시료번호", "식별제(mg/L)", "밀도(g/cm3)", "동점도(mm2/s)"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SingleSelection)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.itemDoubleClicked.connect(lambda _: self.on_edit())
+        layout.addWidget(self.table)
+
+        btn_row = QHBoxLayout()
+        add_btn = QPushButton("추가...")
+        add_btn.clicked.connect(self.on_add)
+        edit_btn = QPushButton("편집...")
+        edit_btn.clicked.connect(self.on_edit)
+        del_btn = QPushButton("삭제")
+        del_btn.clicked.connect(self.on_delete)
+        import_btn = QPushButton("JSON 가져오기...")
+        import_btn.clicked.connect(self.on_import)
+        export_btn = QPushButton("JSON 내보내기...")
+        export_btn.clicked.connect(self.on_export)
+        btn_row.addWidget(add_btn)
+        btn_row.addWidget(edit_btn)
+        btn_row.addWidget(del_btn)
+        btn_row.addStretch(1)
+        btn_row.addWidget(import_btn)
+        btn_row.addWidget(export_btn)
+        layout.addLayout(btn_row)
+
+        close_row = QHBoxLayout()
+        close_row.addStretch(1)
+        close_btn = QPushButton("닫기")
+        close_btn.clicked.connect(self.accept)
+        close_row.addWidget(close_btn)
+        layout.addLayout(close_row)
+
+        self._refresh_table()
+
+    # -- 드래그앤드롭으로 새 후보 추가 -------------------------------------
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        paths = [u.toLocalFile() for u in event.mimeData().urls() if u.toLocalFile()]
+        event.acceptProposedAction()
+        for path in paths:
+            editor = RawMaterialRecordEditor(self.parser, parent=self)
+            editor.preload_file(path)
+            if editor.exec() == QDialog.Accepted and editor.result_record:
+                self._add_record_safely(editor.result_record)
+
+    # -- 테이블 표시 ---------------------------------------------------------
+    def _refresh_table(self):
+        self.table.setRowCount(len(self.db.records))
+        for row, r in enumerate(self.db.records):
+            values = [r.name, r.oil_type, r.sample_no,
+                      f"{r.marker_conc:.2f}", f"{r.density:.4f}", f"{r.viscosity:.3f}"]
+            for col, v in enumerate(values):
+                item = QTableWidgetItem(v)
+                if col == 0:
+                    item.setData(Qt.UserRole, r.id)
+                self.table.setItem(row, col, item)
+
+    def _selected_record(self) -> Optional[RawMaterialRecord]:
+        rows = self.table.selectionModel().selectedRows() if self.table.selectionModel() else []
+        if not rows:
+            return None
+        rec_id = self.table.item(rows[0].row(), 0).data(Qt.UserRole)
+        return self.db.get(rec_id)
+
+    # -- 버튼 핸들러 -----------------------------------------------------------
+    def _add_record_safely(self, record: RawMaterialRecord):
+        try:
+            self.db.add(record)
+        except OSError as e:
+            QMessageBox.critical(self, "저장 오류", f"DB 파일에 저장하는 중 오류가 발생했습니다:\n{e}")
+            return
+        self._refresh_table()
+        self.db_changed.emit()
+
+    def on_add(self):
+        editor = RawMaterialRecordEditor(self.parser, parent=self)
+        if editor.exec() == QDialog.Accepted and editor.result_record:
+            self._add_record_safely(editor.result_record)
+
+    def on_edit(self):
+        record = self._selected_record()
+        if record is None:
+            QMessageBox.information(self, "선택 없음", "편집할 항목을 목록에서 선택해주세요.")
+            return
+        editor = RawMaterialRecordEditor(self.parser, record=record, parent=self)
+        if editor.exec() == QDialog.Accepted and editor.result_record:
+            try:
+                self.db.update(editor.result_record)
+            except (OSError, KeyError) as e:
+                QMessageBox.critical(self, "저장 오류", f"수정 내용을 저장하는 중 오류가 발생했습니다:\n{e}")
+                return
+            self._refresh_table()
+            self.db_changed.emit()
+
+    def on_delete(self):
+        record = self._selected_record()
+        if record is None:
+            QMessageBox.information(self, "선택 없음", "삭제할 항목을 목록에서 선택해주세요.")
+            return
+        reply = QMessageBox.question(
+            self, "삭제 확인", f"'{record.name}' 항목을 삭제하시겠습니까?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            try:
+                self.db.delete(record.id)
+            except OSError as e:
+                QMessageBox.critical(self, "저장 오류", f"삭제 내용을 저장하는 중 오류가 발생했습니다:\n{e}")
+                return
+            self._refresh_table()
+            self.db_changed.emit()
+
+    def on_import(self):
+        path, _ = QFileDialog.getOpenFileName(self, "원료 DB JSON 가져오기", "", "JSON Files (*.json)")
+        if not path:
+            return
+        try:
+            added = self.db.import_json(path)
+            self._refresh_table()
+            self.db_changed.emit()
+            QMessageBox.information(self, "완료", f"{added}건을 가져왔습니다.")
+        except Exception as e:
+            QMessageBox.critical(self, "오류", f"가져오기 중 오류가 발생했습니다:\n{e}")
+
+    def on_export(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "원료 DB JSON 내보내기", "raw_material_db.json", "JSON Files (*.json)")
+        if not path:
+            return
+        try:
+            self.db.export_json(path)
+            QMessageBox.information(self, "완료", "내보내기가 완료되었습니다.")
+        except Exception as e:
+            QMessageBox.critical(self, "오류", f"내보내기 중 오류가 발생했습니다:\n{e}")
+
+
+# ---------------------------------------------------------------------------
 # 탭 2: Case 2 - 미지 원료 추정 & DB 탐색
 # ---------------------------------------------------------------------------
 class Case2Tab(QWidget):
@@ -430,16 +720,25 @@ class Case2Tab(QWidget):
 
         self.diesel_sample: Optional[FuelSample] = None
         self.fake_sample: Optional[FuelSample] = None
-        self.candidate_db: list = []
+
+        # 원료 후보 DB (영속 저장, 추가/편집/삭제는 DB 관리 창에서).
+        # DB 파일을 읽거나 쓸 수 없는 환경(권한이 제한된 PC 등)이어도 앱 자체는
+        # 반드시 떠야 하므로, 여기서 예외가 나도 삼키고 빈 DB로 계속 진행한다.
+        self.db = RawMaterialDatabase()
+        self._db_load_error: Optional[str] = None
+        try:
+            self.db.load()
+            seed_example_records(self.db)
+        except OSError as e:
+            self._db_load_error = str(e)
+
         # 파일 선택 즉시 표시용 미리보기 파형 캐시
         self._preview_waveforms: dict = {}
-        # 역추정 결과 저장 (별도 창 표시용)
-        self.last_est_waveform: Optional[np.ndarray] = None
-        self.last_est_props = None
-        self.last_est_a: float = 0.0
+        # 최근 DB 매칭 결과 (행 선택 시 상세 보기용)
+        self._last_matches: list = []
 
         self._build_ui()
-        self._load_default_db()
+        self._update_db_summary()
 
     # ------------------------------------------------------------
     def _build_ui(self):
@@ -458,7 +757,7 @@ class Case2Tab(QWidget):
             lambda p: self._update_preview("Diesel", p, "green", "경유(Diesel)"))
         self.fake_file_row.file_selected.connect(
             lambda p: self._update_preview("Fake", p, "black", "가짜석유(Fake)"))
-        # 두 파일이 모두 선택되면 자동으로 전처리 + 미지 원료 추정 실행
+        # 두 파일이 모두 선택되면 자동으로 전처리 + DB 매칭 실행
         self.diesel_file_row.file_selected.connect(self._maybe_auto_process)
         self.fake_file_row.file_selected.connect(self._maybe_auto_process)
 
@@ -474,84 +773,56 @@ class Case2Tab(QWidget):
         input_layout.addWidget(self.load_btn)
         left_panel.addWidget(input_group)
 
-        db_group = QGroupBox("2. 원료 후보 DB (GC 파형 CSV/JSON)")
+        db_group = QGroupBox("2. 원료 후보 DB")
         db_layout = QVBoxLayout(db_group)
-
-        hint = QLabel("원료 후보 크로마토그램 CSV 파일들을 아래 목록으로 드래그앤드롭하거나 버튼으로 추가하세요.")
-        hint.setStyleSheet("color: gray; font-size: 10px;")
-        db_layout.addWidget(hint)
-
-        self.candidate_list = QListWidget()
-        self.candidate_list.setAcceptDrops(True)
-        self.candidate_list.setDragDropMode(QListWidget.DropOnly)
-        self.candidate_list.setDefaultDropAction(Qt.CopyAction)
-        self.candidate_list.setMaximumHeight(90)
-        # 드롭 이벤트를 가로채어 파일 경로를 수집
-        self.candidate_list.dragEnterEvent = self._cand_drag_enter
-        self.candidate_list.dragMoveEvent = self._cand_drag_move
-        self.candidate_list.dropEvent = self._cand_drop
-        db_layout.addWidget(self.candidate_list)
-
-        db_btn_row = QHBoxLayout()
-        self.db_add_btn = QPushButton("CSV 파일 추가...")
-        self.db_add_btn.clicked.connect(self.on_add_candidate_files)
-        self.db_remove_btn = QPushButton("선택 항목 제거")
-        self.db_remove_btn.clicked.connect(self.on_remove_candidate)
-        self.db_clear_btn = QPushButton("목록 초기화")
-        self.db_clear_btn.clicked.connect(self.on_clear_candidates)
-        db_btn_row.addWidget(self.db_add_btn)
-        db_btn_row.addWidget(self.db_remove_btn)
-        db_btn_row.addWidget(self.db_clear_btn)
-        db_layout.addLayout(db_btn_row)
-
-        db_layout.addWidget(QLabel("또는 JSON DB 파일 일괄 로드:"))
-        db_json_row = QHBoxLayout()
-        self.db_path_edit = QLineEdit()
-        self.db_path_edit.setPlaceholderText("원료 DB JSON 파일 경로 (선택사항)")
-        self.db_browse_btn = QPushButton("JSON 불러오기...")
-        self.db_browse_btn.clicked.connect(self.on_browse_db)
-        db_json_row.addWidget(self.db_path_edit, stretch=1)
-        db_json_row.addWidget(self.db_browse_btn)
-        db_layout.addLayout(db_json_row)
-
+        self.db_summary_label = QLabel("")
+        db_layout.addWidget(self.db_summary_label)
+        db_manage_btn = QPushButton("원료 DB 관리 (추가/편집/삭제)...")
+        db_manage_btn.clicked.connect(self.on_open_db_manager)
+        db_layout.addWidget(db_manage_btn)
         left_panel.addWidget(db_group)
 
-        ratio_group = QGroupBox("3. 혼합비율 (a: 경유 비율) — 자동 추정 또는 수동 설정")
-        ratio_layout = QVBoxLayout(ratio_group)
+        match_group = QGroupBox("3. DB 후보 매칭 — 각 후보를 원료로 대입해 최적 비율을 자동 계산")
+        match_layout = QVBoxLayout(match_group)
+        self.match_btn = QPushButton("DB 후보 매칭 실행")
+        self.match_btn.clicked.connect(self.on_match_candidates)
+        match_layout.addWidget(self.match_btn)
 
-        auto_row = QHBoxLayout()
-        self.auto_a_btn = QPushButton("식별제+밀도+동점도+파형으로 혼합비율 자동 추정")
-        self.auto_a_btn.clicked.connect(self.on_auto_estimate_a)
-        self.auto_a_label = QLabel("")
-        auto_row.addWidget(self.auto_a_btn)
-        auto_row.addWidget(self.auto_a_label, stretch=1)
-        ratio_layout.addLayout(auto_row)
+        self.result_table = QTableWidget(0, 4)
+        self.result_table.setHorizontalHeaderLabels(["순위", "원료명", "추정 경유비율", "재구성오차"])
+        self.result_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.result_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.result_table.itemDoubleClicked.connect(lambda _: self.on_show_match_detail())
+        match_layout.addWidget(self.result_table)
+
+        self.show_detail_btn = QPushButton("선택 후보 상세 비교 보기")
+        self.show_detail_btn.clicked.connect(self.on_show_match_detail)
+        self.show_detail_btn.setEnabled(False)
+        match_layout.addWidget(self.show_detail_btn)
+        left_panel.addWidget(match_group)
+
+        manual_group = QGroupBox("4. (참고용) 수동 비율로 미지 원료 개형 보기")
+        manual_layout = QVBoxLayout(manual_group)
+        manual_hint = QLabel(
+            "DB에 맞는 후보가 없을 때, 비율을 직접 지정해 '있을 법한' 원료 파형 개형만 대략 살펴보는 보조 도구입니다.\n"
+            "경유+가짜석유 파형만으로는 비율을 자동으로 정확히 알아낼 수 없으므로, 정확한 결과는 위의 DB 매칭을 사용하세요."
+        )
+        manual_hint.setStyleSheet("color: gray; font-size: 10px;")
+        manual_hint.setWordWrap(True)
+        manual_layout.addWidget(manual_hint)
 
         self.ratio_slider = QSlider(Qt.Horizontal)
         self.ratio_slider.setRange(1, 999)   # a=1(원료 0%) 정의불가 -> 상한 제한
         self.ratio_slider.setValue(650)
         self.ratio_slider.valueChanged.connect(self.on_slider_changed)
-        self.ratio_value_label = QLabel("경유 65.0% (수동 설정 또는 자동 추정 결과)")
-        ratio_layout.addWidget(self.ratio_slider)
-        ratio_layout.addWidget(self.ratio_value_label)
-        left_panel.addWidget(ratio_group)
+        self.ratio_value_label = QLabel("경유 65.0% (수동 설정)")
+        manual_layout.addWidget(self.ratio_slider)
+        manual_layout.addWidget(self.ratio_value_label)
 
-        search_group = QGroupBox("4. 미지 원료 파형 역추정 & DB 탐색")
-        search_layout = QVBoxLayout(search_group)
-        self.search_btn = QPushButton("역추정 및 유사 원료 탐색 실행")
-        self.search_btn.clicked.connect(self.on_search)
-        search_layout.addWidget(self.search_btn)
-
-        self.show_est_btn = QPushButton("예상 원료 크로마토그램 별도 창에 보기")
-        self.show_est_btn.clicked.connect(self.on_show_estimated_window)
-        self.show_est_btn.setEnabled(False)
-        search_layout.addWidget(self.show_est_btn)
-
-        self.result_table = QTableWidget(0, 4)
-        self.result_table.setHorizontalHeaderLabels(["순위", "원료명", "일치율(종합)", "파형 일치율(%)"])
-        self.result_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        search_layout.addWidget(self.result_table)
-        left_panel.addWidget(search_group)
+        self.show_manual_btn = QPushButton("이 비율로 원료 개형 미리보기")
+        self.show_manual_btn.clicked.connect(self.on_show_manual_preview)
+        manual_layout.addWidget(self.show_manual_btn)
+        left_panel.addWidget(manual_group)
 
         left_panel.addStretch(1)
         left_widget = QWidget()
@@ -567,198 +838,22 @@ class Case2Tab(QWidget):
         main_layout.addWidget(splitter)
 
     # ------------------------------------------------------------
-    def _load_default_db(self):
-        """예시 원료 DB (실제 운영시 JSON 파일로 대체 가능)."""
-        t = np.linspace(self.parser.ref_time_start, self.parser.ref_time_end, self.parser.ref_time_points)
-
-        def gauss(center_ratio, width, amp):
-            center = t.min() + center_ratio * (t.max() - t.min())
-            return amp * np.exp(-0.5 * ((t - center) / width) ** 2)
-
-        self.candidate_db = [
-            RawMaterialCandidate("등유 유사 원료 A", gauss(0.2, 0.8, 1.0) + gauss(0.5, 1.0, 0.3),
-                                  FuelProperties(marker_conc=5.0, density=0.800, viscosity=1.5)),
-            RawMaterialCandidate("용제 유사 원료 B", gauss(0.35, 1.0, 1.0),
-                                  FuelProperties(marker_conc=2.0, density=0.780, viscosity=1.1)),
-            RawMaterialCandidate("윤활기유 유사 원료 C", gauss(0.7, 1.5, 1.0) + gauss(0.9, 1.0, 0.5),
-                                  FuelProperties(marker_conc=1.0, density=0.870, viscosity=8.0)),
-            RawMaterialCandidate("혼합 용제 원료 D", gauss(0.4, 0.6, 0.7) + gauss(0.6, 0.7, 0.7),
-                                  FuelProperties(marker_conc=3.0, density=0.820, viscosity=2.5)),
-        ]
-
-    # ---- 원료 후보 리스트 (드래그앤드롭) 관리 ---------------------------
-    def _cand_drag_enter(self, event):
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
+    def _update_db_summary(self):
+        if self._db_load_error:
+            self.db_summary_label.setText(
+                f"⚠ DB 파일을 열 수 없습니다 ({self._db_load_error}). "
+                f"이번 세션 동안은 임시로만 사용되며 저장되지 않습니다.")
+            self.db_summary_label.setStyleSheet("color: #b00020;")
         else:
-            event.ignore()
+            self.db_summary_label.setText(f"등록된 원료 후보: {len(self.db.records)}건")
 
-    def _cand_drag_move(self, event):
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-        else:
-            event.ignore()
+    def on_open_db_manager(self):
+        dialog = RawMaterialDBDialog(self.db, self.parser, parent=self)
+        dialog.db_changed.connect(self._update_db_summary)
+        dialog.exec()
+        self._update_db_summary()
 
-    def _cand_drop(self, event):
-        paths = [u.toLocalFile() for u in event.mimeData().urls() if u.toLocalFile()]
-        self._add_candidate_paths(paths)
-        event.acceptProposedAction()
-
-    def _add_candidate_paths(self, paths):
-        added = 0
-        for p in paths:
-            ext = os.path.splitext(p)[1].lower()
-            if ext in (".csv", ".txt", ".tsv", ".xlsx", ".xls"):
-                # 중복 방지
-                existing = [self.candidate_list.item(i).data(Qt.UserRole)
-                            for i in range(self.candidate_list.count())]
-                if p not in existing:
-                    self.candidate_list.addItem(os.path.basename(p))
-                    self.candidate_list.item(self.candidate_list.count() - 1).setData(Qt.UserRole, p)
-                    self.candidate_list.item(self.candidate_list.count() - 1).setToolTip(p)
-                    added += 1
-        if added:
-            # 실제 후보 객체는 탐색 실행 시점에 파일을 로드해 생성
-            self.candidate_db = []  # 파일 기반 목록을 쓰도록 초기화
-            self.show_est_btn.setEnabled(self.show_est_btn.isEnabled())  # 상태 유지
-            QMessageBox.information(self, "후보 추가", f"{added}개의 원료 후보 파일을 목록에 추가했습니다.")
-
-    def on_add_candidate_files(self):
-        paths, _ = QFileDialog.getOpenFileNames(
-            self, "원료 후보 GC 파일 선택 (여러 개 가능)", "",
-            "Excel/CSV Files (*.xlsx *.xls *.csv *.txt *.tsv);;All Files (*)"
-        )
-        if paths:
-            self._add_candidate_paths(paths)
-
-    def on_remove_candidate(self):
-        for item in self.candidate_list.selectedItems():
-            self.candidate_list.takeItem(self.candidate_list.row(item))
-
-    def on_clear_candidates(self):
-        self.candidate_list.clear()
-
-    def _load_candidates_from_list(self):
-        """후보 목록 위젯에 등록된 파일들을 읽어 RawMaterialCandidate 리스트로 만든다."""
-        candidates = []
-        if self.candidate_list.count() == 0:
-            return candidates
-        # 후보들도 입력 샘플과 동일 기준축으로 리샘플링되어야 비교 가능
-        ref_t = self.parser.reference_time
-        for i in range(self.candidate_list.count()):
-            path = self.candidate_list.item(i).data(Qt.UserRole)
-            name = os.path.splitext(os.path.basename(path))[0]
-            try:
-                wf = self.parser.load_file(path, name=name)
-                wf = self.parser.correct_baseline(wf)
-                wf = self.parser.resample(wf, target_time=ref_t)
-                wf = self.parser.normalize(wf)
-                candidates.append(RawMaterialCandidate(name, wf.intensity, FuelProperties()))
-            except Exception as e:
-                print(f"[경고] 후보 '{name}' 로드 실패: {e}")
-        return candidates
-
-    def on_browse_db(self):
-        path, _ = QFileDialog.getOpenFileName(self, "원료 DB JSON 파일 선택", "", "JSON Files (*.json)")
-        if not path:
-            return
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            t = np.linspace(self.parser.ref_time_start, self.parser.ref_time_end, self.parser.ref_time_points)
-            db = []
-            for item in data:
-                intensity = np.array(item["intensity"], dtype=float)
-                if len(intensity) != len(t):
-                    # 길이가 다르면 균등 리샘플 (간단 보간)
-                    src_t = np.linspace(t.min(), t.max(), len(intensity))
-                    intensity = np.interp(t, src_t, intensity)
-                props = FuelProperties(
-                    marker_conc=item.get("marker_conc", 0.0),
-                    density=item.get("density", 0.0),
-                    viscosity=item.get("viscosity", 0.0),
-                )
-                db.append(RawMaterialCandidate(item["name"], intensity, props))
-            self.candidate_db = db
-            self.db_path_edit.setText(path)
-            self.candidate_list.clear()  # JSON 사용 시 파일 목록은 비움
-            QMessageBox.information(self, "완료", f"원료 DB {len(db)}건을 로드했습니다.")
-        except Exception as e:
-            QMessageBox.critical(self, "오류", f"DB 로드 중 오류가 발생했습니다:\n{e}")
-
-    def on_load_data(self):
-        try:
-            diesel_path = self.diesel_file_row.get_path()
-            fake_path = self.fake_file_row.get_path()
-            if not (diesel_path and fake_path):
-                QMessageBox.warning(self, "입력 오류", "경유 및 가짜석유 GC 파일을 모두 선택해주세요.")
-                return
-
-            diesel_wf = self.parser.load_file(diesel_path, name="Diesel")
-            fake_wf = self.parser.load_file(fake_path, name="Fake")
-            self.parser.set_reference_time_from_data([diesel_wf, fake_wf])
-
-            def process(wf: GCWaveform) -> GCWaveform:
-                wf = self.parser.correct_baseline(wf)
-                wf = self.parser.resample(wf)
-                wf = self.parser.normalize(wf)
-                return wf
-
-            diesel_wf = process(diesel_wf)
-            fake_wf = process(fake_wf)
-
-            self.diesel_sample = FuelSample(
-                "Diesel", diesel_wf.time, diesel_wf.intensity, self.diesel_props_group.get_properties())
-            self.fake_sample = FuelSample(
-                "Fake", fake_wf.time, fake_wf.intensity, self.fake_props_group.get_properties())
-
-            self._plot_inputs()
-            # 경유+가짜석유 두 크로마토그램이 입력되면 즉시 미지 원료를 추정하여 별도 창에 표시
-            self._auto_estimate_and_show()
-        except Exception as e:
-            QMessageBox.critical(self, "오류", f"데이터 로드 중 오류가 발생했습니다:\n{e}")
-
-    def _auto_estimate_and_show(self):
-        """
-        경유와 가짜석유 두 크로마토그램만으로 미지 원료 파형을 자동 추정하고
-        별도 창에 크로마토그램을 띄운다. (혼합비율 a는 자동 추정 사용)
-        """
-        try:
-            # 1) 혼합비율 자동 추정 (식별제+밀도+동점도+파형 종합)
-            result = estimate_a_from_all_properties(
-                self.fake_sample.intensity,
-                self.diesel_sample.intensity,
-                self.fake_sample.properties,
-                self.diesel_sample.properties,
-            )
-            a_opt = result["a_optimal"]
-            self.ratio_slider.setValue(int(round(a_opt * 1000)))
-            self.auto_a_label.setText(f"자동 추정: 경유 {a_opt*100:.1f}%")
-
-            # 2) 미지 원료 파형 역추정
-            raw_est_wave = deconvolve_raw_waveform(
-                self.fake_sample.intensity, self.diesel_sample.intensity, a_opt)
-            raw_est_props = estimate_unknown_raw_properties(
-                a_opt, self.fake_sample.properties, self.diesel_sample.properties)
-
-            self.last_est_waveform = raw_est_wave
-            self.last_est_props = raw_est_props
-            self.last_est_a = a_opt
-            self.show_est_btn.setEnabled(True)
-
-            # 3) 메인 그래프에도 역추정 파형 오버레이
-            self._plot_inputs()
-            self.canvas.axes.plot(self.diesel_sample.time, raw_est_wave,
-                                   label=f"역추정 원료 파형 (a={a_opt:.2f})",
-                                   color="red", linestyle="--", linewidth=1.8)
-            self.canvas.axes.legend(loc="upper right", fontsize=8)
-            self.canvas.draw()
-
-            # 4) 별도 창으로 미지 원료 크로마토그램 표시
-            self.on_show_estimated_window()
-        except Exception as e:
-            QMessageBox.critical(self, "자동 추정 오류", f"미지 원료 자동 추정 중 오류가 발생했습니다:\n{e}")
-
+    # ------------------------------------------------------------
     def _update_preview(self, key: str, path: str, color: str, label: str):
         """파일 선택 즉시 해당 파형을 독자 색상으로 미리보기 그래프에 표시."""
         try:
@@ -769,9 +864,9 @@ class Case2Tab(QWidget):
             QMessageBox.critical(self, "로드 오류", f"'{label}' 파일을 읽는 중 오류:\n{e}")
 
     def _maybe_auto_process(self):
-        """경유와 가짜석유 파일이 모두 선택되면 자동으로 전처리 및 미지 원료 추정을 실행."""
+        """경유와 가짜석유 파일이 모두 선택되면 자동으로 전처리 및 DB 매칭을 실행."""
         if self.diesel_file_row.get_path() and self.fake_file_row.get_path():
-            self.on_load_data()  # 내부에서 _auto_estimate_and_show()까지 호출됨
+            self.on_load_data()  # 내부에서 DB에 후보가 있으면 매칭까지 자동 실행
 
     def _redraw_preview(self):
         self.canvas.axes.clear()
@@ -802,130 +897,202 @@ class Case2Tab(QWidget):
 
     def on_slider_changed(self, value: int):
         a = value / 1000.0
-        self.ratio_value_label.setText(f"경유 {a*100:.1f}% (수동 설정 또는 자동 추정 결과)")
+        self.ratio_value_label.setText(f"경유 {a*100:.1f}% (수동 설정)")
 
-    def on_auto_estimate_a(self):
-        """식별제+밀도+동점도+파형을 모두 활용해 혼합비율 a를 자동 추정."""
+    def on_load_data(self):
+        try:
+            diesel_path = self.diesel_file_row.get_path()
+            fake_path = self.fake_file_row.get_path()
+            if not (diesel_path and fake_path):
+                QMessageBox.warning(self, "입력 오류", "경유 및 가짜석유 GC 파일을 모두 선택해주세요.")
+                return
+
+            diesel_wf = self.parser.load_file(diesel_path, name="Diesel")
+            fake_wf = self.parser.load_file(fake_path, name="Fake")
+            self.parser.set_reference_time_from_data([diesel_wf, fake_wf])
+
+            def process(wf: GCWaveform) -> GCWaveform:
+                wf = self.parser.correct_baseline(wf)
+                wf = self.parser.resample(wf)
+                wf = self.parser.normalize(wf)
+                return wf
+
+            diesel_wf = process(diesel_wf)
+            fake_wf = process(fake_wf)
+
+            self.diesel_sample = FuelSample(
+                "Diesel", diesel_wf.time, diesel_wf.intensity, self.diesel_props_group.get_properties())
+            self.fake_sample = FuelSample(
+                "Fake", fake_wf.time, fake_wf.intensity, self.fake_props_group.get_properties())
+
+            self._plot_inputs()
+            # 등록된 후보가 있으면 곧바로 DB 매칭까지 자동 실행
+            if self.db.records:
+                self.on_match_candidates()
+        except Exception as e:
+            QMessageBox.critical(self, "오류", f"데이터 로드 중 오류가 발생했습니다:\n{e}")
+
+    # ------------------------------------------------------------
+    def on_match_candidates(self):
+        """DB의 각 원료 후보를 실제로 대입해 Case 1과 동일한 SLSQP로 최적 혼합비율을
+        구하고, 재구성 오차가 작은 순으로 정렬해 보여준다."""
         if not (self.diesel_sample and self.fake_sample):
             QMessageBox.warning(self, "입력 오류", "먼저 데이터를 로드해주세요.")
             return
-        try:
-            result = estimate_a_from_all_properties(
-                self.fake_sample.intensity,
-                self.diesel_sample.intensity,
-                self.fake_sample.properties,
-                self.diesel_sample.properties,
-            )
-            a_opt = result["a_optimal"]
-            self.ratio_slider.setValue(int(round(a_opt * 1000)))
-            est = result.get("estimated_raw_properties")
-            extra = ""
-            if est is not None:
-                extra = (f" | 추정 원료 물성: 식별제 {est.marker_conc:.1f} mg/L, "
-                         f"밀도 {est.density:.4f}, 동점도 {est.viscosity:.2f}")
-            self.auto_a_label.setText(f"자동 추정: 경유 {a_opt*100:.1f}%{extra}")
-            self.on_slider_changed(self.ratio_slider.value())
-        except Exception as e:
-            QMessageBox.critical(self, "오류", f"자동 추정 중 오류가 발생했습니다:\n{e}")
 
-    def on_show_estimated_window(self):
-        """역추정된 미지 원료 크로마토그램을 별도 팝업 창에 크게 표시."""
-        if self.last_est_waveform is None or self.diesel_sample is None:
-            QMessageBox.warning(self, "결과 없음", "먼저 '역추정 및 유사 원료 탐색 실행'을 눌러주세요.")
+        candidates = self.db.to_candidates(self.parser.reference_time)
+        if not candidates:
+            QMessageBox.warning(
+                self, "입력 오류",
+                "원료 후보 DB가 비어 있습니다. '원료 DB 관리'에서 후보를 추가해주세요.")
+            return
+
+        try:
+            matches = match_fake_against_candidates(
+                self.diesel_sample, self.fake_sample, candidates, top_n=5)
+        except Exception as e:
+            QMessageBox.critical(self, "오류", f"DB 매칭 중 오류가 발생했습니다:\n{e}")
+            return
+
+        self._last_matches = matches
+
+        self.result_table.setRowCount(len(matches))
+        for row, m in enumerate(matches):
+            self.result_table.setItem(row, 0, QTableWidgetItem(str(row + 1)))
+            self.result_table.setItem(row, 1, QTableWidgetItem(m.candidate_name))
+            self.result_table.setItem(row, 2, QTableWidgetItem(f"{m.a_optimal*100:.1f}%"))
+            self.result_table.setItem(row, 3, QTableWidgetItem(f"{m.final_cost:.3e}"))
+        self.show_detail_btn.setEnabled(bool(matches))
+
+        if matches:
+            best = matches[0]
+            self.ratio_slider.setValue(int(round(best.a_optimal * 1000)))
+            self._plot_match(best)
+            QMessageBox.information(
+                self, "매칭 완료",
+                f"최적 후보: {best.candidate_name} (경유 {best.a_optimal*100:.1f}%, "
+                f"재구성오차 {best.final_cost:.3e})\n"
+                f"추정 원료 물성치 — 식별제: {best.estimated_properties.marker_conc:.2f} mg/L, "
+                f"밀도: {best.estimated_properties.density:.4f} g/cm3, "
+                f"동점도: {best.estimated_properties.viscosity:.3f} mm2/s"
+            )
+        else:
+            QMessageBox.information(self, "결과 없음", "매칭 가능한 후보가 없습니다.")
+
+    def _plot_match(self, match):
+        """경유/가짜석유/후보 원본 파형 + 최적비율에서의 예상 배합을 함께 표시."""
+        cand = match.candidate
+        self._plot_inputs()
+        if cand is not None:
+            self.canvas.axes.plot(self.diesel_sample.time, cand.intensity,
+                                   label=f"후보: {match.candidate_name}", color="red", alpha=0.6)
+            cand_sample = FuelSample(match.candidate_name, self.diesel_sample.time, cand.intensity, cand.properties)
+            blended, _ = FuelBlendingSimulator(self.diesel_sample, cand_sample).simulate(match.a_optimal)
+            self.canvas.axes.plot(self.diesel_sample.time, blended,
+                                   label=f"예상 배합 (a={match.a_optimal:.2f})",
+                                   color="purple", linestyle="--", linewidth=1.8)
+        self.canvas.axes.legend(loc="upper right", fontsize=8)
+        self.canvas.draw()
+
+    def on_show_match_detail(self):
+        rows = self.result_table.selectionModel().selectedRows() if self.result_table.selectionModel() else []
+        if not rows or not self._last_matches:
+            QMessageBox.information(self, "선택 없음", "표에서 후보를 먼저 선택해주세요.")
+            return
+        match = self._last_matches[rows[0].row()]
+        cand = match.candidate
+        if cand is None:
             return
 
         dialog = QDialog(self)
-        dialog.setWindowTitle("예상 미지 원료 크로마토그램")
+        dialog.setWindowTitle(f"상세 비교 — {match.candidate_name}")
         dialog.resize(900, 550)
         layout = QVBoxLayout(dialog)
 
         canvas = MplCanvas(dialog, width=9, height=5)
-        canvas.axes.plot(
-            self.diesel_sample.time, self.last_est_waveform,
-            label=f"역추정 원료 파형 (경유비율 a={self.last_est_a:.2f})",
-            color="red", linewidth=1.2,
-        )
-        # 비교를 위해 경유/가짜 파형도 흐리게 함께 표시
         canvas.axes.plot(self.diesel_sample.time, self.diesel_sample.intensity,
-                          label="경유(Diesel)", color="green", alpha=0.35, linewidth=0.8)
-        if self.fake_sample is not None:
-            canvas.axes.plot(self.fake_sample.time, self.fake_sample.intensity,
-                              label="가짜석유(Fake)", color="black", alpha=0.35, linewidth=0.8)
+                          label="경유(Diesel)", color="green", alpha=0.5, linewidth=0.8)
+        canvas.axes.plot(self.fake_sample.time, self.fake_sample.intensity,
+                          label="가짜석유(Fake, 실측)", color="black", linewidth=1.5)
+        canvas.axes.plot(self.diesel_sample.time, cand.intensity,
+                          label=f"등록 후보: {match.candidate_name}", color="red", alpha=0.6)
+        cand_sample = FuelSample(match.candidate_name, self.diesel_sample.time, cand.intensity, cand.properties)
+        blended, _ = FuelBlendingSimulator(self.diesel_sample, cand_sample).simulate(match.a_optimal)
+        canvas.axes.plot(self.diesel_sample.time, blended,
+                          label=f"예상 배합 (a={match.a_optimal:.2f})",
+                          color="purple", linestyle="--", linewidth=1.8)
         canvas.axes.set_xlabel("Retention Time (min)")
         canvas.axes.set_ylabel("Normalized Intensity")
-        canvas.axes.set_title(
-            f"예상 미지 원료 크로마토그램 — R_est(t)=max(0,(Fake - a·Diesel)/(1-a)), a={self.last_est_a:.3f}")
+        canvas.axes.set_title(f"경유 {match.a_optimal*100:.1f}% : {match.candidate_name} "
+                               f"{match.raw_ratio*100:.1f}% — 재구성오차 {match.final_cost:.3e}")
         canvas.axes.legend(loc="upper right", fontsize=9)
         canvas.draw()
         layout.addWidget(canvas)
 
-        if self.last_est_props is not None:
-            info = QLabel(
-                f"역추정 물성치 — 식별제: {self.last_est_props.marker_conc:.2f} mg/L, "
-                f"밀도: {self.last_est_props.density:.4f} g/cm3, "
-                f"동점도: {self.last_est_props.viscosity:.3f} mm2/s"
-            )
-            info.setWordWrap(True)
-            layout.addWidget(info)
+        info = QLabel(
+            f"추정 원료 물성치 — 식별제: {match.estimated_properties.marker_conc:.2f} mg/L, "
+            f"밀도: {match.estimated_properties.density:.4f} g/cm3, "
+            f"동점도: {match.estimated_properties.viscosity:.3f} mm2/s | "
+            f"파형 유사도: {match.wave_similarity*100:.1f}%"
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
 
         close_btn = QPushButton("닫기")
         close_btn.clicked.connect(dialog.accept)
         layout.addWidget(close_btn)
         dialog.exec()
 
-    def on_search(self):
+    # ------------------------------------------------------------
+    def on_show_manual_preview(self):
+        """(참고용) 수동으로 지정한 비율에서의 미지 원료 개형을 역추정해 보여준다.
+        자동 추정이 아니라 사용자가 직접 정한 a에 대한 단순 대수적 역산이므로,
+        DB에 등록된 실제 후보가 없을 때의 대략적 참고용으로만 사용해야 한다."""
         if not (self.diesel_sample and self.fake_sample):
             QMessageBox.warning(self, "입력 오류", "먼저 데이터를 로드해주세요.")
             return
 
-        # 1) 후보 소스 결정: 파일 목록이 있으면 그것을 사용, 없으면 JSON/기본 DB
-        candidates = []
-        if self.candidate_list.count() > 0:
-            candidates = self._load_candidates_from_list()
-        if not candidates and self.candidate_db:
-            candidates = self.candidate_db
-        if not candidates:
-            QMessageBox.warning(self, "입력 오류", "원료 후보 DB가 비어 있습니다. CSV 파일을 드래그앤드롭으로 추가하거나 JSON DB를 불러오세요.")
-            return
+        a = self.ratio_slider.value() / 1000.0
+        raw_est_wave = deconvolve_raw_waveform(
+            self.fake_sample.intensity, self.diesel_sample.intensity, a)
+        raw_est_props = estimate_unknown_raw_properties(
+            a, self.fake_sample.properties, self.diesel_sample.properties)
 
-        try:
-            a = self.ratio_slider.value() / 1000.0
+        dialog = QDialog(self)
+        dialog.setWindowTitle("(참고용) 수동 비율 원료 개형 미리보기")
+        dialog.resize(900, 550)
+        layout = QVBoxLayout(dialog)
 
-            raw_est_wave = deconvolve_raw_waveform(
-                self.fake_sample.intensity, self.diesel_sample.intensity, a)
-            raw_est_props = estimate_unknown_raw_properties(
-                a, self.fake_sample.properties, self.diesel_sample.properties)
+        canvas = MplCanvas(dialog, width=9, height=5)
+        canvas.axes.plot(
+            self.diesel_sample.time, raw_est_wave,
+            label=f"역추정 원료 개형 (경유비율 a={a:.2f}, 수동 지정)",
+            color="red", linewidth=1.2,
+        )
+        canvas.axes.plot(self.diesel_sample.time, self.diesel_sample.intensity,
+                          label="경유(Diesel)", color="green", alpha=0.35, linewidth=0.8)
+        canvas.axes.plot(self.fake_sample.time, self.fake_sample.intensity,
+                          label="가짜석유(Fake)", color="black", alpha=0.35, linewidth=0.8)
+        canvas.axes.set_xlabel("Retention Time (min)")
+        canvas.axes.set_ylabel("Normalized Intensity")
+        canvas.axes.set_title(
+            f"(참고용) R_est(t)=max(0,(Fake - a·Diesel)/(1-a)), a={a:.3f} — 자동 추정 아님")
+        canvas.axes.legend(loc="upper right", fontsize=9)
+        canvas.draw()
+        layout.addWidget(canvas)
 
-            # 별도 창 표시를 위해 결과 저장
-            self.last_est_waveform = raw_est_wave
-            self.last_est_props = raw_est_props
-            self.last_est_a = a
-            self.show_est_btn.setEnabled(True)
+        info = QLabel(
+            f"역추정 물성치(참고용) — 식별제: {raw_est_props.marker_conc:.2f} mg/L, "
+            f"밀도: {raw_est_props.density:.4f} g/cm3, "
+            f"동점도: {raw_est_props.viscosity:.3f} mm2/s"
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
 
-            self._plot_inputs()
-            self.canvas.axes.plot(self.diesel_sample.time, raw_est_wave,
-                                   label=f"역추정 원료 파형 (a={a:.2f})",
-                                   color="red", linestyle="--", linewidth=1.8)
-            self.canvas.axes.legend(loc="upper right", fontsize=8)
-            self.canvas.draw()
-
-            matches = search_similar_raw_materials(
-                raw_est_wave, raw_est_props, candidates, top_n=5)
-
-            self.result_table.setRowCount(len(matches))
-            for row, m in enumerate(matches):
-                self.result_table.setItem(row, 0, QTableWidgetItem(str(row + 1)))
-                self.result_table.setItem(row, 1, QTableWidgetItem(m.candidate_name))
-                self.result_table.setItem(row, 2, QTableWidgetItem(f"{m.combined_score*100:.1f}%"))
-                self.result_table.setItem(row, 3, QTableWidgetItem(f"{m.similarity*100:.1f}%"))
-
-            QMessageBox.information(
-                self, "완료",
-                f"역추정 물성치 — 식별제: {raw_est_props.marker_conc:.2f} mg/L, "
-                f"밀도: {raw_est_props.density:.4f} g/cm3, 동점도: {raw_est_props.viscosity:.3f} mm2/s"
-            )
-        except Exception as e:
-            QMessageBox.critical(self, "오류", f"탐색 중 오류가 발생했습니다:\n{e}")
+        close_btn = QPushButton("닫기")
+        close_btn.clicked.connect(dialog.accept)
+        layout.addWidget(close_btn)
+        dialog.exec()
 
 
 # ---------------------------------------------------------------------------
@@ -937,11 +1104,12 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("경유 가짜석유 원료 및 혼합비율 역추적/시뮬레이션 프로그램")
         self.resize(1400, 850)
 
-        self.parser = GCDataParser()
-
+        # 탭마다 별도의 GCDataParser 인스턴스를 사용한다. 하나를 공유하면 한 탭에서
+        # 데이터를 로드할 때 갱신되는 기준 시간축(reference_time)이 다른 탭에도
+        # 영향을 주는 의도치 않은 결합이 생긴다.
         tabs = QTabWidget()
-        tabs.addTab(Case1Tab(self.parser), "원료 분석 & 배합 시뮬레이션 (Case 1)")
-        tabs.addTab(Case2Tab(self.parser), "미지 원료 추정 & DB 탐색 (Case 2)")
+        tabs.addTab(Case1Tab(GCDataParser()), "원료 분석 & 배합 시뮬레이션 (Case 1)")
+        tabs.addTab(Case2Tab(GCDataParser()), "미지 원료 추정 & DB 탐색 (Case 2)")
 
         self.setCentralWidget(tabs)
 

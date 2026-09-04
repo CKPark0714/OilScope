@@ -80,6 +80,20 @@ class MatchResult:
     combined_score: float                # 파형 유사도 + 물성치를 종합한 최종 점수
 
 
+@dataclass
+class CandidateMatchResult:
+    """DB 후보 1건을 실제 '원료'로 가정하고 SLSQP로 최적 혼합비율을 맞춘 결과."""
+
+    candidate_name: str
+    a_optimal: float                     # 이 후보를 원료로 가정했을 때 최적 경유 비율
+    raw_ratio: float                     # 1 - a_optimal
+    final_cost: float                    # MixRatioEstimator 목적함수 최종값 (작을수록 더 잘 맞음)
+    success: bool                        # SLSQP 수렴 여부
+    estimated_properties: FuelProperties
+    wave_similarity: float               # 참고용 코사인 유사도 (최적 a에서의 예상 파형 vs 실측 가짜석유)
+    candidate: "RawMaterialCandidate" = None   # 원본 후보 객체 (이름이 중복돼도 정확히 식별하기 위함)
+
+
 # ---------------------------------------------------------------------------
 # 물성 혼합 공식 (모듈 레벨 함수 - 재사용 목적)
 # ---------------------------------------------------------------------------
@@ -251,111 +265,32 @@ class MixRatioEstimator:
 
 
 # ---------------------------------------------------------------------------
-# Case 2 사전단계: 식별제+파형 기반 혼합비율(a) 추정 (원료를 모를 때)
+# (구) Case 2 사전단계: 경유+가짜석유 파형만으로 혼합비율 a를 "맹목적으로" 추정하는
+# 시도(estimate_a_from_all_properties)가 이 자리에 있었으나, 검증 결과 원리적으로
+# 성립하지 않는 접근이라 제거했다.
+#
+# 이유: diesel과 fake만 주어지고 원료(raw)가 완전히 미지수인 상태에서는,
+#   fake(t) = a*diesel(t) + (1-a)*raw(t)
+# 라는 식에서 raw(t)가 "0 이상"이라는 것 외에는 아무 제약이 없으므로, 임의의 a에
+# 대해 raw(t) = (fake(t) - a*diesel(t)) / (1-a) 를 그냥 "정답"으로 두면 항상 완벽히
+# 재현된다 (파형 재구성오차가 a에 대해 거의 상수 0). 유일하게 남는 제약은
+# "raw(t) >= 0"인데 이것만으로는 a 하나의 값을 찍어낼 수 없고(무수히 많은 a가
+# 이 조건을 만족), 물성치(식별제/밀도/동점도) 3개 방정식도 미지수 4개(a + 원료
+# 물성치 3개)에 비해 방정식이 하나 부족해 근본적으로 미결정계(underdetermined)다.
+# 실제로 합성 노이즈 데이터로 검증했을 때 이 옛 함수는 항상 a=0 근처로 발산했다.
+#
+# 결론: "원료를 전혀 모르는 상태"에서 파형/물성치만으로 a를 자동 추정하는 것은
+# 신뢰할 수 없다. 대신 아래 match_fake_against_candidates()처럼, 원료 후보 DB에
+# 등록된 실제 후보들을 하나씩 "원료"로 대입해 Case 1과 동일한(이미 검증된)
+# MixRatioEstimator로 최적 비율을 구하고, 가장 잘 맞는 후보를 채택하는 방식으로
+# 대체했다. 이는 수학적으로 잘 정의된 문제(알려진 3개 신호로 1개 미지수를 맞추는
+# 문제)이며, 포렌식 분석 워크플로("등록된 원료들 중 어느 것이 가장 잘 설명하는가")
+# 와도 자연스럽게 맞아떨어진다.
 # ---------------------------------------------------------------------------
-def estimate_a_from_all_properties(
-    fake_intensity: np.ndarray,
-    diesel_intensity: np.ndarray,
-    fake_props: FuelProperties,
-    diesel_props: FuelProperties,
-    raw_prop_bounds: Optional[dict] = None,
-) -> dict:
-    """
-    원료를 모를 때, **식별제 + 밀도 + 동점도 + 파형**을 모두 활용해
-    혼합비율 a(경유 부피비율)를 추정한다.
-
-    접근법: 경유 외에 "원료"라고 볼 수 있는 신호 성분을 가짜석유에서 추정하고,
-            SLSQP로 "가짜석유 = a*경유 + (1-a)*원료"를 가장 잘 만족하면서
-            역산된 원료 물성치가 타당 범위에 들어가는 a를 찾는다.
-
-        목적함수 J(a) = w_wave * 재구성오차(a) + w_prop * 물성범위위반(a)
-
-        재구성오차(a): fake와 a*diesel의 차이(양수부분)를 원료 proxy로 쓰고,
-                       혼합 모델 a*diesel + (1-a)*proxy 가 fake를 얼마나 잘
-                       재현하는지를 측정한다.
-        물성범위위반(a): 식별제/밀도/동점도 역산값이 [raw_prop_bounds] 범위를
-                       벗어나는 정도.
-
-    Parameters
-    ----------
-    raw_prop_bounds : dict, optional
-        미지 원료 물성치의 타당 범위. 기본값:
-            {"marker": (0, 500), "density": (0.75, 0.95), "viscosity": (0.5, 20.0)}
-    """
-    if raw_prop_bounds is None:
-        raw_prop_bounds = {
-            "marker": (0.0, 500.0),
-            "density": (0.75, 0.95),
-            "viscosity": (0.5, 20.0),
-        }
-
-    # --- 원료 proxy: a의 그리드 전체에서 NNLS로 가장 잘 맞는 원료 성분을 추정 ---
-    from scipy.optimize import nnls as _nnls
-
-    fake_max = fake_intensity.max()
-    diesel_max = diesel_intensity.max()
-    # 정규화된 파형 간 스케일 차이를 흡수하기 위한 스케일 비
-    scale_ratio = (fake_max / diesel_max) if diesel_max > 0 else 1.0
-
-    best_a, best_err = 0.7, np.inf
-    for a in np.linspace(0.05, 0.95, 91):
-        # fake ≈ alpha*diesel + beta*raw_proxy 형태로 맞추기 위해,
-        # 우선 fake에서 a*scale_ratio*diesel 기여분을 빼고 나머지를 원료 성분으로 본다.
-        residual = fake_intensity - a * scale_ratio * diesel_intensity
-        # 물리적으로 음수는 불가 -> 과도한 음수는 패널티
-        neg_penalty = float(np.sum(np.clip(-residual, 0.0, None)) ** 2)
-        pos_residual = np.clip(residual, 0.0, None)
-        # 나머지(양수부분)를 원료 파형 proxy로 사용했을 때 재구성 오차
-        est = a * scale_ratio * diesel_intensity + (1.0 - a) * pos_residual / max(pos_residual.max(), 1e-12)
-        err = float(np.mean((est - fake_intensity) ** 2)) + 0.1 * neg_penalty
-        if err < best_err:
-            best_err = err
-            best_a = float(a)
-
-    def raw_props_at(a: float) -> FuelProperties:
-        return estimate_unknown_raw_properties(a, fake_props, diesel_props)
-
-    def prop_violation(a: float) -> float:
-        """역산된 원료 물성치가 타당 범위를 벗어나는 정도 (작을수록 좋음)."""
-        rp = raw_props_at(a)
-        v = 0.0
-        lo, hi = raw_prop_bounds["marker"]
-        v += max(0.0, lo - rp.marker_conc) + max(0.0, rp.marker_conc - hi)
-        lo, hi = raw_prop_bounds["density"]
-        v += (max(0.0, lo - rp.density) + max(0.0, rp.density - hi)) * 100.0
-        lo, hi = raw_prop_bounds["viscosity"]
-        v += (max(0.0, lo - rp.viscosity) + max(0.0, rp.viscosity - hi)) * 0.1
-        return v
-
-    # 파형 기반 best_a 주변을 물성 제약과 함께 SLSQP로 미세 조정
-    def objective(a_arr: np.ndarray) -> float:
-        a = float(a_arr[0])
-        residual = fake_intensity - a * scale_ratio * diesel_intensity
-        neg_penalty = float(np.sum(np.clip(-residual, 0.0, None)) ** 2)
-        return 10.0 * neg_penalty + 1.0 * prop_violation(a)
-
-    result = minimize(
-        objective,
-        x0=np.array([best_a]),
-        method="SLSQP",
-        bounds=[(0.0, 0.999)],
-        options={"maxiter": 300, "ftol": 1e-12},
-    )
-    best_a = float(np.clip(result.x[0], 0.0, 0.999))
-    est_raw = raw_props_at(best_a)
-
-    return {
-        "a_optimal": best_a,
-        "raw_ratio": 1.0 - best_a,
-        "method": "all_properties+waveform(SLSQP)",
-        "estimated_raw_properties": est_raw,
-        "cost": float(result.fun),
-        "success": bool(result.success),
-    }
 
 
 # ---------------------------------------------------------------------------
-# Case 2: 원료를 모르는 경우 - 파형 역추정(Deconvolution) + DB 유사도 탐색
+# Case 2: 원료를 모르는 경우 - 파형 역추정(Deconvolution) + DB 후보 매칭
 # ---------------------------------------------------------------------------
 def deconvolve_raw_waveform(
     fake_intensity: np.ndarray,
@@ -491,6 +426,59 @@ def search_similar_raw_materials(
     return results[:top_n]
 
 
+def match_fake_against_candidates(
+    diesel: FuelSample,
+    fake: FuelSample,
+    candidates: Sequence[RawMaterialCandidate],
+    initial_guess: float = 0.7,
+    top_n: int = 5,
+) -> List[CandidateMatchResult]:
+    """
+    등록된 원료 후보 DB의 각 후보를 실제 "원료"라고 가정하고, Case 1과 동일한
+    MixRatioEstimator(SLSQP)로 최적 혼합비율 a를 구한 뒤, 재구성 오차(final_cost)가
+    가장 작은 순으로 정렬해 반환한다.
+
+    원료가 완전히 미지수인 상태에서 파형만으로 a를 추정하는 것은 수학적으로
+    미결정계라 신뢰할 수 없지만(analyzer.py 상단 주석 참고), 후보 하나하나는
+    "경유/후보/가짜석유가 모두 알려진" Case 1과 동일한 잘 정의된 문제이므로,
+    후보를 대입해 보는 방식이 훨씬 안정적이고 정확하다.
+
+    Parameters
+    ----------
+    diesel, fake : FuelSample
+        동일 기준시간축으로 리샘플링된 경유/가짜석유 시료.
+    candidates : Sequence[RawMaterialCandidate]
+        원료 후보 DB (파형은 diesel/fake와 동일한 기준시간축으로 리샘플링되어 있어야 함).
+    initial_guess : float
+        SLSQP 초기값 (기본 0.7).
+    top_n : int
+        반환할 상위 후보 수.
+    """
+    results: List[CandidateMatchResult] = []
+    for cand in candidates:
+        if cand.intensity.shape != diesel.intensity.shape:
+            continue  # 기준시간축이 다른 후보는 건너뜀 (호출측에서 리샘플링 보장 필요)
+
+        cand_sample = FuelSample(cand.name, diesel.time, cand.intensity, cand.properties)
+        estimator = MixRatioEstimator(diesel, cand_sample, fake)
+        est = estimator.estimate(initial_guess=initial_guess)
+        wave_sim = _cosine_sim(est["estimated_waveform"], fake.intensity)
+
+        results.append(CandidateMatchResult(
+            candidate_name=cand.name,
+            a_optimal=est["a_optimal"],
+            raw_ratio=est["raw_ratio"],
+            final_cost=est["final_cost"],
+            success=est["success"],
+            estimated_properties=est["estimated_properties"],
+            wave_similarity=wave_sim,
+            candidate=cand,
+        ))
+
+    results.sort(key=lambda r: r.final_cost)
+    return results[:top_n]
+
+
 # ---------------------------------------------------------------------------
 # 모듈 단독 실행 시 스모크 테스트
 # ---------------------------------------------------------------------------
@@ -520,6 +508,7 @@ if __name__ == "__main__":
     result = estimator.estimate(initial_guess=0.5)
     print(f"[Case1] 실제 a={true_a}, 추정 a={result['a_optimal']:.4f}, "
           f"수렴={result['success']}, cost={result['final_cost']:.2e}")
+    assert abs(result["a_optimal"] - true_a) < 1e-3, "Case1 혼합비율 역추적 회귀!"
 
     # 시뮬레이터 테스트
     sim = FuelBlendingSimulator(diesel, raw)
@@ -544,3 +533,20 @@ if __name__ == "__main__":
     for m in matches:
         print(f"  - {m.candidate_name}: score={m.combined_score:.4f}, "
               f"wave_sim={m.similarity:.4f}, prop_dist={m.property_distance:.4f}")
+
+    # Case 2 신규 테스트: DB 후보를 실제로 대입해 최적 비율을 맞추는 방식.
+    # (과거 estimate_a_from_all_properties가 노이즈 있는 데이터에서 a=0으로
+    #  발산하던 회귀를 다시 잡아내기 위한 테스트 — 반드시 노이즈를 포함시킨다.)
+    rng2 = np.random.default_rng(7)
+    noisy_fake_wave = fake_wave + 0.01 * rng2.standard_normal(len(t))
+    noisy_fake_wave = np.clip(noisy_fake_wave, 0.0, None)
+    noisy_fake = FuelSample("FakeNoisy", t, noisy_fake_wave, fake_props)
+    matches2 = match_fake_against_candidates(diesel, noisy_fake, db, top_n=3)
+    print("[Case2] match_fake_against_candidates 결과:")
+    for m in matches2:
+        print(f"  - {m.candidate_name}: a={m.a_optimal:.4f}, cost={m.final_cost:.3e}, "
+              f"wave_sim={m.wave_similarity:.4f}")
+    assert matches2[0].candidate_name == "RawA", "가장 잘 맞는 후보를 못 찾음 (회귀!)"
+    assert abs(matches2[0].a_optimal - true_a) < 0.05, "노이즈 있는 데이터에서 혼합비율 추정 회귀!"
+
+    print("\n[전체 통과] 모든 스모크 테스트 검증 완료.")
