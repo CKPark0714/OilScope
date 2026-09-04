@@ -2,8 +2,8 @@
 """
 gui_main.py
 
-한국석유관리원 시험팀용 "자동차용 경유 가짜석유 원료 및 혼합비율 역추적/시뮬레이션"
-데스크톱 프로그램 메인 GUI (PySide6 기반).
+OilScope — 한국석유관리원 시험팀용 "자동차용 경유 가짜석유 원료 및 혼합비율
+역추적/시뮬레이션" 데스크톱 프로그램 메인 GUI (PySide6 기반).
 
 - 탭 1: 원료 분석 & 배합 시뮬레이션 (Case 1)
     * 경유/원료/가짜석유 GC 엑셀 파일 선택 및 물성치 입력
@@ -28,11 +28,12 @@ from typing import Optional
 import numpy as np
 
 from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QTabWidget, QVBoxLayout, QHBoxLayout,
     QFormLayout, QGroupBox, QLabel, QLineEdit, QPushButton, QFileDialog,
     QSlider, QDoubleSpinBox, QTableWidget, QTableWidgetItem, QMessageBox,
-    QHeaderView, QSplitter, QDialog,
+    QHeaderView, QSplitter, QDialog, QScrollArea, QFrame,
 )
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
@@ -61,9 +62,12 @@ from data_parser import GCDataParser, GCWaveform
 from analyzer import (
     FuelProperties, FuelSample, FuelBlendingSimulator, MixRatioEstimator,
     deconvolve_raw_waveform, estimate_unknown_raw_properties,
-    match_fake_against_candidates,
+    match_fake_against_candidates, normalize_density_g_cm3,
 )
-from raw_material_db import RawMaterialDatabase, RawMaterialRecord, seed_example_records
+from raw_material_db import (
+    RawMaterialDatabase, RawMaterialRecord, seed_example_records, import_master_excel,
+)
+import theme
 
 
 # ---------------------------------------------------------------------------
@@ -95,10 +99,16 @@ class PropertyInputGroup(QGroupBox):
         self.marker_spin.setSuffix(" mg/L")
 
         self.density_spin = QDoubleSpinBox()
-        self.density_spin.setRange(0.0, 2.0)
+        # 시험성적서에는 밀도가 g/cm3(0.7926)로도, kg/m3(792.6)로도 적혀 있을 수
+        # 있다. 범위를 kg/m3 스케일까지 넉넉히 열어두고, 입력 즉시
+        # normalize_density_g_cm3()로 자동 판별해 g/cm3로 통일한다(둘 다 같은
+        # 숫자를 나타내므로, 범위를 좁게 잡아 kg/m3 값을 잘라내는 것보다 이 편이
+        # 안전하다).
+        self.density_spin.setRange(0.0, 2000.0)
         self.density_spin.setDecimals(4)
         self.density_spin.setSingleStep(0.001)
         self.density_spin.setSuffix(" g/cm3")
+        self.density_spin.valueChanged.connect(self._normalize_density_input)
 
         self.viscosity_spin = QDoubleSpinBox()
         self.viscosity_spin.setRange(0.0, 1000.0)
@@ -120,6 +130,12 @@ class PropertyInputGroup(QGroupBox):
         self.marker_spin.setValue(props.marker_conc)
         self.density_spin.setValue(props.density)
         self.viscosity_spin.setValue(props.viscosity)
+
+    def _normalize_density_input(self, value: float) -> None:
+        """밀도를 kg/m3로 입력해도(예: 792.6) 즉시 g/cm3(0.7926)로 스냅시킨다."""
+        normalized = normalize_density_g_cm3(value)
+        if normalized != value:
+            self.density_spin.setValue(normalized)
 
 
 class DropLineEdit(QLineEdit):
@@ -434,27 +450,80 @@ class RawMaterialRecordEditor(QDialog):
         super().__init__(parent)
         self.parser = parser
         self.setWindowTitle("원료 후보 편집" if record else "원료 후보 추가")
-        self.resize(480, 460)
+        self.resize(520, 640)
 
         self._record_id: Optional[str] = record.id if record else None
         self._new_wf: Optional[GCWaveform] = None       # 새로 선택된 크로마토그램 (원본, 베이스라인 보정만 적용)
         self._existing_wave = None                       # 기존 레코드의 (time, intensity, source_filename)
         self.result_record: Optional[RawMaterialRecord] = None
 
-        layout = QVBoxLayout(self)
+        outer_layout = QVBoxLayout(self)
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        outer_layout.addWidget(scroll, stretch=1)
+
+        content = QWidget()
+        scroll.setWidget(content)
+        layout = QVBoxLayout(content)
+
         form = QFormLayout()
         self.name_edit = QLineEdit()
         self.oil_type_edit = QLineEdit()
         self.sample_no_edit = QLineEdit()
+        self.collected_date_edit = QLineEdit()
+        self.inspection_type_edit = QLineEdit()
         self.notes_edit = QLineEdit()
-        form.addRow("원료명:", self.name_edit)
-        form.addRow("유종:", self.oil_type_edit)
-        form.addRow("시료번호:", self.sample_no_edit)
-        form.addRow("비고(기타 시험값):", self.notes_edit)
+        form.addRow("원료명(상표명 등):", self.name_edit)
+        form.addRow("유종(제품명):", self.oil_type_edit)
+        form.addRow("시료번호(의뢰번호):", self.sample_no_edit)
+        form.addRow("채취일:", self.collected_date_edit)
+        form.addRow("검사유형:", self.inspection_type_edit)
+        form.addRow("비고:", self.notes_edit)
         layout.addLayout(form)
 
-        self.props_group = PropertyInputGroup("물성치")
+        self.props_group = PropertyInputGroup("핵심 물성치 (배합/역추적 계산에 실제로 사용됨)")
         layout.addWidget(self.props_group)
+
+        detail_group = QGroupBox("상세 시험값 (선택 입력 - 참고/표시용, 계산식에는 직접 쓰이지 않음)")
+        detail_form = QFormLayout(detail_group)
+
+        def _spin(maximum=100000.0, decimals=3, suffix=""):
+            sp = QDoubleSpinBox()
+            sp.setRange(-100000.0, maximum)
+            sp.setDecimals(decimals)
+            if suffix:
+                sp.setSuffix(suffix)
+            return sp
+
+        self.flash_point_spin = _spin(1000.0, 2, " °C")
+        self.distill_ibp_spin = _spin(1000.0, 2, " °C")
+        self.distill_10_spin = _spin(1000.0, 2, " °C")
+        self.distill_50_spin = _spin(1000.0, 2, " °C")
+        self.distill_90_spin = _spin(1000.0, 2, " °C")
+        self.distill_ep_spin = _spin(1000.0, 2, " °C")
+        self.distill_residue_spin = _spin(100.0, 2, " %")
+        self.sulfur_spin = _spin(1000.0, 2, " mg/kg")
+        self.marker_1494db_spin = _spin(100000.0, 2, " mg/L")
+        self.marker_s10_spin = _spin(100000.0, 2, " mg/L")
+        self.composition_1_spin = _spin(100.0, 3, " %")
+        self.composition_2_spin = _spin(100.0, 3, " %")
+        self.composition_3_spin = _spin(100.0, 3, " %")
+
+        detail_form.addRow("인화점:", self.flash_point_spin)
+        distill_row = QHBoxLayout()
+        for w in (self.distill_ibp_spin, self.distill_10_spin, self.distill_50_spin,
+                  self.distill_90_spin, self.distill_ep_spin):
+            distill_row.addWidget(w)
+        detail_form.addRow("증류성상(초류/10%/50%/90%/종말):", distill_row)
+        detail_form.addRow("증류 잔류량:", self.distill_residue_spin)
+        detail_form.addRow("황분:", self.sulfur_spin)
+        detail_form.addRow("식별제(Unimark 1494DB):", self.marker_1494db_spin)
+        detail_form.addRow("식별제(Accutrace S10):", self.marker_s10_spin)
+        comp_row = QHBoxLayout()
+        for w in (self.composition_1_spin, self.composition_2_spin, self.composition_3_spin):
+            comp_row.addWidget(w)
+        detail_form.addRow("조성분포(#1/#2/#3):", comp_row)
+        layout.addWidget(detail_group)
 
         file_group = QGroupBox("크로마토그램 (드래그앤드롭 또는 파일 선택)")
         file_layout = QVBoxLayout(file_group)
@@ -465,6 +534,10 @@ class RawMaterialRecordEditor(QDialog):
         self.file_status_label.setStyleSheet("color: gray; font-size: 10px;")
         self.file_status_label.setWordWrap(True)
         file_layout.addWidget(self.file_status_label)
+        self.chromatogram_canvas = MplCanvas(file_group, width=6, height=2.6)
+        self.chromatogram_canvas.axes.set_xlabel("Retention Time (min)")
+        self.chromatogram_canvas.axes.set_ylabel("Intensity")
+        file_layout.addWidget(self.chromatogram_canvas)
         layout.addWidget(file_group)
 
         if record:
@@ -473,11 +546,28 @@ class RawMaterialRecordEditor(QDialog):
             self.sample_no_edit.setText(record.sample_no)
             self.notes_edit.setText(record.notes)
             self.props_group.set_properties(record.properties)
+            self.collected_date_edit.setText(record.collected_date)
+            self.inspection_type_edit.setText(record.inspection_type)
+            self.flash_point_spin.setValue(record.flash_point)
+            self.distill_ibp_spin.setValue(record.distill_ibp)
+            self.distill_10_spin.setValue(record.distill_10)
+            self.distill_50_spin.setValue(record.distill_50)
+            self.distill_90_spin.setValue(record.distill_90)
+            self.distill_ep_spin.setValue(record.distill_ep)
+            self.distill_residue_spin.setValue(record.distill_residue)
+            self.sulfur_spin.setValue(record.sulfur)
+            self.marker_1494db_spin.setValue(record.marker_1494db)
+            self.marker_s10_spin.setValue(record.marker_s10)
+            self.composition_1_spin.setValue(record.composition_1)
+            self.composition_2_spin.setValue(record.composition_2)
+            self.composition_3_spin.setValue(record.composition_3)
             if record.has_waveform():
                 self._existing_wave = (record.time, record.intensity, record.source_filename)
                 self.file_status_label.setText(
                     f"기존 크로마토그램 사용 중 ({record.source_filename or '알 수 없음'}, "
                     f"{len(record.time)}포인트) — 새 파일을 선택하면 교체됩니다.")
+                self._plot_chromatogram(record.time, record.intensity,
+                                         record.source_filename or "기존 크로마토그램")
 
         btn_row = QHBoxLayout()
         btn_row.addStretch(1)
@@ -487,7 +577,7 @@ class RawMaterialRecordEditor(QDialog):
         save_btn.clicked.connect(self._on_save)
         btn_row.addWidget(cancel_btn)
         btn_row.addWidget(save_btn)
-        layout.addLayout(btn_row)
+        outer_layout.addLayout(btn_row)
 
     def preload_file(self, path: str):
         """드래그앤드롭으로 다이얼로그 자체에 파일이 떨어졌을 때 미리 채워넣기 위한 진입점."""
@@ -500,11 +590,27 @@ class RawMaterialRecordEditor(QDialog):
             wf = self.parser.correct_baseline(wf)
             self._new_wf = wf
             self.file_status_label.setText(f"'{os.path.basename(path)}' 로드됨 ({len(wf.time)}포인트)")
+            self._plot_chromatogram(wf.time, wf.intensity, os.path.basename(path))
+            stem = os.path.splitext(os.path.basename(path))[0]
             if not self.name_edit.text().strip():
-                self.name_edit.setText(os.path.splitext(os.path.basename(path))[0])
+                self.name_edit.setText(stem)
+            if not self.sample_no_edit.text().strip():
+                # 매칭되는 기존 시료가 없어 새 레코드로 만들어지는 경우, 파일명을
+                # 그대로 새 시료번호(의뢰번호)로 채워 넣는다 - 이후 같은 이름의
+                # 크로마토그램을 다시 드래그앤드롭하면 이 레코드에 매칭된다.
+                self.sample_no_edit.setText(stem)
         except Exception as e:
             QMessageBox.critical(self, "로드 오류", f"크로마토그램 로드 중 오류:\n{e}")
             self._new_wf = None
+
+    def _plot_chromatogram(self, time, intensity, label: str):
+        ax = self.chromatogram_canvas.axes
+        ax.clear()
+        ax.plot(time, intensity, color="red", linewidth=0.8)
+        ax.set_xlabel("Retention Time (min)")
+        ax.set_ylabel("Intensity")
+        ax.set_title(label, fontsize=9)
+        self.chromatogram_canvas.draw()
 
     def _on_save(self):
         name = self.name_edit.text().strip()
@@ -519,8 +625,12 @@ class RawMaterialRecordEditor(QDialog):
         elif self._existing_wave is not None:
             time_list, intensity_list, source_filename = self._existing_wave
         else:
-            QMessageBox.warning(self, "입력 오류", "크로마토그램 파일을 선택해주세요.")
-            return
+            # 크로마토그램 없이도 저장을 허용한다 (엑셀 일괄가져오기로 메타데이터만
+            # 먼저 들어온 레코드를 편집할 때가 대표적 - 크로마토그램은 나중에
+            # DB 관리창에 드래그앤드롭하면 시료번호로 자동 매칭되어 붙는다).
+            # 파형 없는 레코드는 has_waveform()이 False가 되어 DB 매칭(to_candidates)
+            # 대상에서 자연히 제외될 뿐, 메타데이터 편집 자체를 막을 이유는 없다.
+            time_list, intensity_list, source_filename = [], [], ""
 
         props = self.props_group.get_properties()
         kwargs = dict(
@@ -534,6 +644,21 @@ class RawMaterialRecordEditor(QDialog):
             source_filename=source_filename,
             time=time_list,
             intensity=intensity_list,
+            collected_date=self.collected_date_edit.text().strip(),
+            inspection_type=self.inspection_type_edit.text().strip(),
+            flash_point=self.flash_point_spin.value(),
+            distill_ibp=self.distill_ibp_spin.value(),
+            distill_10=self.distill_10_spin.value(),
+            distill_50=self.distill_50_spin.value(),
+            distill_90=self.distill_90_spin.value(),
+            distill_ep=self.distill_ep_spin.value(),
+            distill_residue=self.distill_residue_spin.value(),
+            sulfur=self.sulfur_spin.value(),
+            marker_1494db=self.marker_1494db_spin.value(),
+            marker_s10=self.marker_s10_spin.value(),
+            composition_1=self.composition_1_spin.value(),
+            composition_2=self.composition_2_spin.value(),
+            composition_3=self.composition_3_spin.value(),
         )
         if self._record_id:
             kwargs["id"] = self._record_id
@@ -559,6 +684,7 @@ class RawMaterialDBDialog(QDialog):
 
         hint = QLabel(
             "GC 크로마토그램 파일을 이 창으로 드래그앤드롭하면 새 원료 후보 추가 창이 열립니다.\n"
+            "파일명(확장자 제외)이 기존 시료번호(의뢰번호)와 같으면 새로 만들지 않고 그 항목에 크로마토그램만 첨부합니다.\n"
             "※ 이름이 '[예시]'로 시작하는 항목은 최초 실행 시 자동 생성된 참고용 데이터입니다. "
             "'편집'으로 실제 유종/시료번호/시험값을 채우거나 '삭제' 후 실제 데이터를 추가하세요."
         )
@@ -583,6 +709,8 @@ class RawMaterialDBDialog(QDialog):
         edit_btn.clicked.connect(self.on_edit)
         del_btn = QPushButton("삭제")
         del_btn.clicked.connect(self.on_delete)
+        excel_import_btn = QPushButton("엑셀 마스터 목록 가져오기...")
+        excel_import_btn.clicked.connect(self.on_import_excel)
         import_btn = QPushButton("JSON 가져오기...")
         import_btn.clicked.connect(self.on_import)
         export_btn = QPushButton("JSON 내보내기...")
@@ -591,6 +719,7 @@ class RawMaterialDBDialog(QDialog):
         btn_row.addWidget(edit_btn)
         btn_row.addWidget(del_btn)
         btn_row.addStretch(1)
+        btn_row.addWidget(excel_import_btn)
         btn_row.addWidget(import_btn)
         btn_row.addWidget(export_btn)
         layout.addLayout(btn_row)
@@ -612,13 +741,54 @@ class RawMaterialDBDialog(QDialog):
             event.ignore()
 
     def dropEvent(self, event):
+        """
+        파일을 드롭하면, 파일명(확장자 제외)이 기존 레코드의 시료번호(의뢰번호)와
+        일치하는 경우 새 레코드를 만들지 않고 그 레코드에 크로마토그램만 첨부한다
+        (엑셀로 메타데이터만 먼저 가져온 뒤, 크로마토그램 CSV를 나중에 별도로
+        업로드하는 워크플로를 지원하기 위함). 일치하는 기존 레코드가 없으면
+        기존처럼 새 후보 추가 창을 연다.
+        """
         paths = [u.toLocalFile() for u in event.mimeData().urls() if u.toLocalFile()]
         event.acceptProposedAction()
+        attached = 0
         for path in paths:
+            stem = os.path.splitext(os.path.basename(path))[0]
+            existing = self.db.find_by_sample_no(stem)
+            if existing is not None:
+                if self._attach_chromatogram_safely(existing, path):
+                    attached += 1
+                continue
+
             editor = RawMaterialRecordEditor(self.parser, parent=self)
             editor.preload_file(path)
             if editor.exec() == QDialog.Accepted and editor.result_record:
                 self._add_record_safely(editor.result_record)
+
+        if attached:
+            QMessageBox.information(
+                self, "크로마토그램 매칭 완료",
+                f"파일명이 시료번호와 일치하는 기존 후보 {attached}건에 크로마토그램을 첨부했습니다.")
+
+    def _attach_chromatogram_safely(self, record: RawMaterialRecord, path: str) -> bool:
+        """기존 레코드에 크로마토그램 파일을 로드해 첨부한다 (메타데이터는 그대로 유지)."""
+        try:
+            wf = self.parser.load_file(path)
+            wf = self.parser.correct_baseline(wf)
+        except Exception as e:
+            QMessageBox.critical(self, "로드 오류", f"'{os.path.basename(path)}' 크로마토그램 로드 중 오류:\n{e}")
+            return False
+
+        record.time = wf.time.tolist()
+        record.intensity = wf.intensity.tolist()
+        record.source_filename = os.path.basename(path)
+        try:
+            self.db.update(record)
+        except (OSError, KeyError) as e:
+            QMessageBox.critical(self, "저장 오류", f"크로마토그램 첨부를 저장하는 중 오류가 발생했습니다:\n{e}")
+            return False
+        self._refresh_table()
+        self.db_changed.emit()
+        return True
 
     # -- 테이블 표시 ---------------------------------------------------------
     def _refresh_table(self):
@@ -685,6 +855,44 @@ class RawMaterialDBDialog(QDialog):
                 return
             self._refresh_table()
             self.db_changed.emit()
+
+    def on_import_excel(self):
+        """
+        한국석유관리원 검사결과 마스터 엑셀(예: 등유 목록)을 읽어 원료 후보 DB에
+        일괄 반영한다. 크로마토그램 CSV 폴더는 선택사항 — 지정하지 않고 취소하면
+        메타데이터만 먼저 들어가고, 크로마토그램은 나중에 이 창에 드래그앤드롭하면
+        (파일명이 시료번호와 일치할 때) 자동으로 매칭되어 붙는다.
+        """
+        excel_path, _ = QFileDialog.getOpenFileName(
+            self, "원료 마스터 엑셀 선택", "", "Excel Files (*.xls *.xlsx)")
+        if not excel_path:
+            return
+
+        chromatogram_dir = QFileDialog.getExistingDirectory(
+            self, "크로마토그램 CSV 폴더 선택 (선택사항 - 취소하면 메타데이터만 가져옵니다)")
+
+        try:
+            summary = import_master_excel(
+                self.db, excel_path, chromatogram_dir=chromatogram_dir or None)
+        except Exception as e:
+            QMessageBox.critical(self, "오류", f"엑셀 가져오기 중 오류가 발생했습니다:\n{e}")
+            return
+
+        self._refresh_table()
+        self.db_changed.emit()
+
+        lines = [
+            f"총 {summary.total_rows}행 중 추가 {summary.added}건, 갱신 {summary.updated}건"
+            + (f", 건너뜀 {summary.skipped}건" if summary.skipped else ""),
+        ]
+        if chromatogram_dir:
+            lines.append(
+                f"크로마토그램 매칭: {summary.matched_chromatogram}건 성공, "
+                f"{len(summary.unmatched_chromatogram)}건 미매칭")
+        if summary.errors:
+            lines.append(f"오류 {len(summary.errors)}건 (일부만 표시):")
+            lines.extend(summary.errors[:5])
+        QMessageBox.information(self, "가져오기 완료", "\n".join(lines))
 
     def on_import(self):
         path, _ = QFileDialog.getOpenFileName(self, "원료 DB JSON 가져오기", "", "JSON Files (*.json)")
@@ -1101,8 +1309,17 @@ class Case2Tab(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("경유 가짜석유 원료 및 혼합비율 역추적/시뮬레이션 프로그램")
+        self.setWindowTitle("OilScope — 경유 가짜석유 원료 및 혼합비율 역추적/시뮬레이션")
         self.resize(1400, 850)
+        icon_path = theme.icon_path()
+        if os.path.isfile(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
+
+        central = QWidget()
+        central_layout = QVBoxLayout(central)
+        central_layout.setContentsMargins(0, 0, 0, 0)
+        central_layout.setSpacing(0)
+        central_layout.addWidget(self._build_header())
 
         # 탭마다 별도의 GCDataParser 인스턴스를 사용한다. 하나를 공유하면 한 탭에서
         # 데이터를 로드할 때 갱신되는 기준 시간축(reference_time)이 다른 탭에도
@@ -1110,13 +1327,44 @@ class MainWindow(QMainWindow):
         tabs = QTabWidget()
         tabs.addTab(Case1Tab(GCDataParser()), "원료 분석 & 배합 시뮬레이션 (Case 1)")
         tabs.addTab(Case2Tab(GCDataParser()), "미지 원료 추정 & DB 탐색 (Case 2)")
+        central_layout.addWidget(tabs, stretch=1)
 
-        self.setCentralWidget(tabs)
+        self.setCentralWidget(central)
+
+    def _build_header(self) -> QWidget:
+        """K-Petro 로고 + 프로그램명을 보여주는 상단 브랜딩 바."""
+        header = QFrame()
+        header.setStyleSheet(f"background-color: #ffffff; border-bottom: 2px solid {theme.COLOR_GREEN};")
+        layout = QHBoxLayout(header)
+        layout.setContentsMargins(16, 8, 16, 8)
+
+        logo_path = theme.logo_path()
+        if os.path.isfile(logo_path):
+            logo_label = QLabel()
+            pixmap = QPixmap(logo_path)
+            logo_label.setPixmap(pixmap.scaledToHeight(36, Qt.SmoothTransformation))
+            layout.addWidget(logo_label)
+
+        title_label = QLabel("OilScope")
+        title_label.setStyleSheet(
+            f"color: {theme.COLOR_GRAY}; font-size: 18px; font-weight: bold; margin-left: 10px;")
+        layout.addWidget(title_label)
+
+        subtitle_label = QLabel("경유 가짜석유 원료 및 혼합비율 역추적/시뮬레이션")
+        subtitle_label.setStyleSheet(f"color: {theme.COLOR_SILVER}; font-size: 11px; margin-left: 8px;")
+        layout.addWidget(subtitle_label)
+
+        layout.addStretch(1)
+        return header
 
 
 def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+    app.setStyleSheet(theme.APP_STYLESHEET)
+    icon_path = theme.icon_path()
+    if os.path.isfile(icon_path):
+        app.setWindowIcon(QIcon(icon_path))
     window = MainWindow()
     window.show()
     sys.exit(app.exec())

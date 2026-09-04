@@ -5,7 +5,7 @@ on:
   push:
     branches: [main]
     paths:
-      - "FakeOilAnalyzer/**"
+      - "OilScope/**"
       - ".github/workflows/build-windows-exe.yml"
 
 jobs:
@@ -13,7 +13,7 @@ jobs:
     runs-on: windows-latest
     defaults:
       run:
-        working-directory: FakeOilAnalyzer
+        working-directory: OilScope
     steps:
       - uses: actions/checkout@v4
 
@@ -26,12 +26,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Build EXE
+      - name: Build (onedir + zip)
         run: python build_exe.py
 
-      - name: Upload EXE artifact
+      - name: Upload distributable zip
         uses: actions/upload-artifact@v4
         with:
-          name: FakeOilAnalyzer-windows-exe
-          path: FakeOilAnalyzer/dist/FakeOilAnalyzer.exe
+          name: OilScope-windows
+          path: OilScope/dist/OilScope-windows.zip
           if-no-files-found: error
