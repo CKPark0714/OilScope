@@ -342,6 +342,14 @@ class Case1Tab(QWidget):
         left_widget = QWidget()
         left_widget.setLayout(left_panel)
 
+        # 입력 항목이 많아 화면이 작으면 아래쪽 버튼이 잘린다. 스크롤 영역에 넣어
+        # 어떤 해상도에서도 끝까지 닿을 수 있게 한다.
+        left_scroll = QScrollArea()
+        left_scroll.setWidget(left_widget)
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setFrameShape(QFrame.NoFrame)
+        left_scroll.setMinimumWidth(560)
+
         # ---- 우측: 그래프 ----
         self.canvas = MplCanvas(self, width=7, height=6)
         self.trace_toggles = TraceToggleBar([
@@ -357,7 +365,7 @@ class Case1Tab(QWidget):
         right_layout.addWidget(self.trace_toggles)
 
         splitter = QSplitter(Qt.Horizontal)
-        splitter.addWidget(left_widget)
+        splitter.addWidget(left_scroll)
         splitter.addWidget(right_widget)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
@@ -1243,6 +1251,14 @@ class Case2Tab(QWidget):
         left_widget = QWidget()
         left_widget.setLayout(left_panel)
 
+        # 입력 항목이 많아 화면이 작으면 아래쪽 버튼이 잘린다. 스크롤 영역에 넣어
+        # 어떤 해상도에서도 끝까지 닿을 수 있게 한다.
+        left_scroll = QScrollArea()
+        left_scroll.setWidget(left_widget)
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setFrameShape(QFrame.NoFrame)
+        left_scroll.setMinimumWidth(560)
+
         self.canvas = MplCanvas(self, width=7, height=6)
         self.trace_toggles = TraceToggleBar([
             ("diesel", "경유"), ("fake", "가짜석유"),
@@ -1257,7 +1273,7 @@ class Case2Tab(QWidget):
         right_layout.addWidget(self.trace_toggles)
 
         splitter = QSplitter(Qt.Horizontal)
-        splitter.addWidget(left_widget)
+        splitter.addWidget(left_scroll)
         splitter.addWidget(right_widget)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
