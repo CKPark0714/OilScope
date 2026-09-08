@@ -15,7 +15,7 @@ from __future__ import annotations
 import io
 import os
 from datetime import datetime
-from typing import List, Optional, Sequence, Tuple
+from typing import Optional, Sequence, Tuple
 
 from PySide6.QtCore import QSizeF, QUrl
 from PySide6.QtGui import QImage, QPageSize, QTextDocument
