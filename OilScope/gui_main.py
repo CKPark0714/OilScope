@@ -28,7 +28,7 @@ from typing import Optional
 import numpy as np
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QIcon, QPixmap
+from PySide6.QtGui import QIcon, QPixmap, QPainter, QColor
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QTabWidget, QVBoxLayout, QHBoxLayout,
     QFormLayout, QGroupBox, QLabel, QLineEdit, QPushButton, QFileDialog,
@@ -666,6 +666,26 @@ class RawMaterialRecordEditor(QDialog):
         self.accept()
 
 
+def _waveform_status_icon(has_waveform: bool) -> QIcon:
+    """크로마토그램 부착 여부를 나타내는 작은 원형 아이콘.
+    (채운 초록 원 = 크로마토그램 있음, 빈 회색 원 = 아직 없음)"""
+    size = 14
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing)
+    margin = 2
+    if has_waveform:
+        painter.setBrush(QColor("#2E9E4F"))
+        painter.setPen(Qt.NoPen)
+    else:
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(QColor("#B0B0B0"))
+    painter.drawEllipse(margin, margin, size - 2 * margin, size - 2 * margin)
+    painter.end()
+    return QIcon(pixmap)
+
+
 class RawMaterialDBDialog(QDialog):
     """원료 후보 DB 관리 창: 목록 조회, 추가/편집/삭제, 드래그앤드롭 업로드,
     JSON 가져오기/내보내기를 제공한다."""
@@ -692,10 +712,11 @@ class RawMaterialDBDialog(QDialog):
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
-        self.table = QTableWidget(0, 6)
+        self.table = QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels(
-            ["원료명", "유종", "시료번호", "식별제(mg/L)", "밀도(g/cm3)", "동점도(mm2/s)"])
+            ["원료명", "유종", "시료번호", "크로마토그램", "식별제(mg/L)", "밀도(g/cm3)", "동점도(mm2/s)"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setSelectionMode(QTableWidget.SingleSelection)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -794,13 +815,23 @@ class RawMaterialDBDialog(QDialog):
     def _refresh_table(self):
         self.table.setRowCount(len(self.db.records))
         for row, r in enumerate(self.db.records):
-            values = [r.name, r.oil_type, r.sample_no,
-                      f"{r.marker_conc:.2f}", f"{r.density:.4f}", f"{r.viscosity:.3f}"]
-            for col, v in enumerate(values):
+            for col, v in enumerate([r.name, r.oil_type, r.sample_no]):
                 item = QTableWidgetItem(v)
                 if col == 0:
                     item.setData(Qt.UserRole, r.id)
                 self.table.setItem(row, col, item)
+
+            has_wf = r.has_waveform()
+            waveform_item = QTableWidgetItem()
+            waveform_item.setIcon(_waveform_status_icon(has_wf))
+            waveform_item.setTextAlignment(Qt.AlignCenter)
+            waveform_item.setToolTip("크로마토그램 있음" if has_wf else "크로마토그램 없음")
+            self.table.setItem(row, 3, waveform_item)
+
+            for offset, v in enumerate(
+                [f"{r.marker_conc:.2f}", f"{r.density:.4f}", f"{r.viscosity:.3f}"]
+            ):
+                self.table.setItem(row, 4 + offset, QTableWidgetItem(v))
 
     def _selected_record(self) -> Optional[RawMaterialRecord]:
         rows = self.table.selectionModel().selectedRows() if self.table.selectionModel() else []
