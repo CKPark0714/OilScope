@@ -30,7 +30,7 @@ import statistics
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Callable, List, Optional
+from typing import Callable, Iterable, List, Optional
 
 import numpy as np
 import rainbow as rb
@@ -55,6 +55,7 @@ class ConvertResult:
     skipped_existing: int = 0
     skipped_no_sample: int = 0
     skipped_empty: int = 0
+    skipped_not_listed: int = 0
     failed: int = 0
 
 
@@ -131,10 +132,22 @@ def _amplitude(intensity) -> float:
     return float(np.nanmax(arr) - np.nanmin(arr))
 
 
+def _wanted_samples(only_samples: Optional[Iterable[str]]) -> dict:
+    """사용자가 적어 넣은 시료번호 목록을 {비교용 키: 원래 표기}로 정리한다.
+    공백만 있는 목록은 "지정 없음"(=전체 변환)과 같게 본다."""
+    wanted: dict = {}
+    for raw in only_samples or []:
+        token = raw.strip()
+        if token:
+            wanted.setdefault(token.casefold(), token)
+    return wanted
+
+
 def convert_all(
     root: str,
     out_dir: str,
     overwrite: bool = False,
+    only_samples: Optional[Iterable[str]] = None,
     log_cb: Optional[LogCallback] = None,
     should_stop: Optional[StopCallback] = None,
 ) -> ConvertResult:
@@ -148,6 +161,9 @@ def convert_all(
 
     신호가 사실상 없는 런(세척/블랭크성 런, 주입 실패 등)은 CSV로 만들지 않는다.
     판정 기준은 EMPTY_AMPLITUDE_RATIO 참고.
+
+    only_samples에 시료번호를 넘기면 그 시료들만 변환한다. DATA 폴더에 없는 번호는
+    그냥 넘어가고, 어떤 번호를 못 찾았는지만 로그에 남긴다.
 
     overwrite=False(기본)이면 out_dir에 이미 있는 파일은 다시 만들지 않는다 - 매번
     DATA 폴더 전체가 아니라 그 사이 새로 쌓인 시료만 빠르게 처리하기 위함이다. 단
@@ -198,6 +214,21 @@ def convert_all(
         log(LEVEL_INFO, f"빈 데이터 판정 기준: 신호 진폭 {threshold:.4g} 미만"
                         f" (시료번호가 있는 런 진폭 중앙값의 {EMPTY_AMPLITUDE_RATIO:.0%})")
 
+    # 목록이 주어졌으면 여기서 추린다. 빈 데이터 기준(중앙값)은 배치 전체를 보고
+    # 잡은 뒤에 적용해야, 몇 건만 고른 경우에도 판정이 흔들리지 않는다.
+    wanted = _wanted_samples(only_samples)
+    if wanted:
+        found = {r.sample.casefold() for r in runs}
+        listed = [r for r in runs if r.sample.casefold() in wanted]
+        result.skipped_not_listed = len(runs) - len(listed)
+        log(LEVEL_INFO, f"지정한 시료번호 {len(wanted)}개만 변환합니다"
+                        f" (목록에 없는 런 {result.skipped_not_listed}건은 건너뜁니다).")
+        missing = sorted(orig for key, orig in wanted.items() if key not in found)
+        if missing:
+            log(LEVEL_SKIP, f"DATA 폴더에서 찾지 못한 시료번호 {len(missing)}개:"
+                            f" {', '.join(missing)}")
+        runs = listed
+
     valid: List[_Run] = []
     for r in runs:
         if r.amplitude <= 0.0 or r.amplitude < threshold:
@@ -239,12 +270,17 @@ def convert_all(
             result.failed += 1
             log(LEVEL_ERROR, f"{out_name}: 저장 실패 - {e}")
 
-    skipped = result.skipped_existing + result.skipped_no_sample + result.skipped_empty
+    reasons = [f"이미 있음 {result.skipped_existing}",
+               f"시료번호 없음 {result.skipped_no_sample}",
+               f"빈 데이터 {result.skipped_empty}"]
+    if wanted:
+        reasons.append(f"목록에 없음 {result.skipped_not_listed}")
+    skipped = (result.skipped_existing + result.skipped_no_sample
+               + result.skipped_empty + result.skipped_not_listed)
     log(
         LEVEL_INFO,
         f"완료: 변환 {result.converted}건 / 건너뜀 {skipped}건"
-        f"(이미 있음 {result.skipped_existing} · 시료번호 없음 {result.skipped_no_sample}"
-        f" · 빈 데이터 {result.skipped_empty})"
+        f"({' · '.join(reasons)})"
         f" / 실패 {result.failed}건",
     )
     return result

@@ -14,6 +14,7 @@ import json
 import os
 import platform
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -76,8 +77,8 @@ class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("780x580")
-        self.minsize(640, 480)
+        self.geometry("820x700")
+        self.minsize(680, 560)
 
         self.settings = load_settings()
         self._log_queue: "queue.Queue[tuple[str, str]]" = queue.Queue()
@@ -114,6 +115,28 @@ class App(tk.Tk):
         self.var_output = tk.StringVar(value=self.settings.get("output_dir", ""))
         ttk.Entry(frm_paths, textvariable=self.var_output).grid(row=1, column=1, sticky="ew", padx=6, pady=(8, 0))
         ttk.Button(frm_paths, text="찾아보기...", command=self._pick_output).grid(row=1, column=2, pady=(8, 0))
+
+        frm_filter = ttk.LabelFrame(self, text="시료번호 목록 (선택)")
+        frm_filter.pack(fill="x", **pad)
+        ttk.Label(
+            frm_filter,
+            text=("여기에 시료번호를 붙여넣으면 그 시료만 변환합니다 - 한 줄에 하나씩,"
+                  " 쉼표나 공백으로 구분해도 됩니다.\n"
+                  "비워두면 DATA 폴더 안의 모든 시료를 변환합니다."
+                  " 목록에 있는데 DATA 폴더에 없는 번호는 그냥 넘어갑니다."),
+            justify="left",
+            foreground="gray",
+        ).pack(fill="x", padx=8, pady=(4, 2))
+
+        frm_samples = ttk.Frame(frm_filter)
+        frm_samples.pack(fill="x", padx=8, pady=(0, 8))
+        self.txt_samples = tk.Text(frm_samples, height=4, wrap="word", font=("Consolas", 10))
+        samples_scroll = ttk.Scrollbar(frm_samples, command=self.txt_samples.yview)
+        self.txt_samples.configure(yscrollcommand=samples_scroll.set)
+        self.txt_samples.pack(side="left", fill="x", expand=True)
+        samples_scroll.pack(side="right", fill="y")
+        ttk.Button(frm_filter, text="목록 비우기",
+                   command=lambda: self.txt_samples.delete("1.0", "end")).pack(anchor="e", padx=8, pady=(0, 6))
 
         frm_opts = ttk.Frame(self)
         frm_opts.pack(fill="x", **pad)
@@ -194,6 +217,9 @@ class App(tk.Tk):
         os.makedirs(output_dir, exist_ok=True)
 
         overwrite = self.var_overwrite.get()
+        # 시료번호 목록은 일부러 저장하지 않는다 - 다음에 켰을 때 예전 목록이 남아
+        # 있으면 그것만 변환되는 사고가 나기 쉽다.
+        only_samples = [t for t in re.split(r"[\s,;]+", self.txt_samples.get("1.0", "end")) if t]
         save_settings({"input_dir": input_dir, "output_dir": output_dir, "overwrite": overwrite})
 
         self.txt_log.configure(state="normal")
@@ -214,6 +240,7 @@ class App(tk.Tk):
                     input_dir,
                     output_dir,
                     overwrite=overwrite,
+                    only_samples=only_samples,
                     log_cb=on_log,
                     should_stop=self._stop_flag.is_set,
                 )
