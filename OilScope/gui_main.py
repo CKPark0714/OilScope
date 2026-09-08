@@ -33,7 +33,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QTabWidget, QVBoxLayout, QHBoxLayout,
     QFormLayout, QGroupBox, QLabel, QLineEdit, QPushButton, QFileDialog,
     QSlider, QDoubleSpinBox, QTableWidget, QTableWidgetItem, QMessageBox,
-    QHeaderView, QSplitter, QDialog, QScrollArea, QFrame,
+    QHeaderView, QSplitter, QDialog, QScrollArea, QFrame, QCheckBox,
 )
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
@@ -81,6 +81,35 @@ class MplCanvas(FigureCanvasQTAgg):
         self.axes = self.fig.add_subplot(111)
         super().__init__(self.fig)
         self.setParent(parent)
+
+
+class TraceToggleBar(QWidget):
+    """그래프에 겹쳐 그릴 파형을 골라 켜고 끄는 체크박스 줄.
+
+    파형이 여러 개 겹치면 보고 싶은 것만 남기고 끄는 편이 비교하기 쉽다.
+    처음에는 모두 켜진 상태이고, 상태가 바뀌면 changed 시그널로 알린다.
+    """
+
+    changed = Signal()
+
+    def __init__(self, items, parent=None):
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(6, 0, 6, 0)
+        layout.addWidget(QLabel("그래프 표시:"))
+
+        self._boxes = {}
+        for key, label in items:
+            box = QCheckBox(label)
+            box.setChecked(True)
+            box.toggled.connect(lambda _on: self.changed.emit())
+            layout.addWidget(box)
+            self._boxes[key] = box
+        layout.addStretch(1)
+
+    def is_on(self, key: str) -> bool:
+        box = self._boxes.get(key)
+        return box.isChecked() if box is not None else True
 
 
 # ---------------------------------------------------------------------------
@@ -302,10 +331,21 @@ class Case1Tab(QWidget):
 
         # ---- 우측: 그래프 ----
         self.canvas = MplCanvas(self, width=7, height=6)
+        self.trace_toggles = TraceToggleBar([
+            ("diesel", "경유"), ("raw", "원료"),
+            ("fake", "가짜석유"), ("blend", "예상 배합"),
+        ])
+        self.trace_toggles.changed.connect(self._refresh_plot)
+
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.addWidget(self.canvas, stretch=1)
+        right_layout.addWidget(self.trace_toggles)
 
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(left_widget)
-        splitter.addWidget(self.canvas)
+        splitter.addWidget(right_widget)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
 
@@ -321,9 +361,20 @@ class Case1Tab(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "로드 오류", f"'{label}' 파일을 읽는 중 오류:\n{e}")
 
+    def _refresh_plot(self):
+        """표시할 파형을 바꿨을 때 지금 화면에 맞는 그림을 다시 그린다."""
+        if self.simulator:
+            self.on_slider_changed(self.ratio_slider.value())
+        elif self.diesel_sample or self.raw_sample or self.fake_sample:
+            self._plot_base_waveforms()
+        else:
+            self._redraw_preview()
+
     def _redraw_preview(self):
         self.canvas.axes.clear()
-        for key in ("Diesel", "Raw", "Fake"):
+        for key, toggle_key in (("Diesel", "diesel"), ("Raw", "raw"), ("Fake", "fake")):
+            if not self.trace_toggles.is_on(toggle_key):
+                continue
             if key in self._preview_waveforms:
                 t, intensity, color, label = self._preview_waveforms[key]
                 self.canvas.axes.plot(t, intensity, label=label, color=color,
@@ -381,13 +432,13 @@ class Case1Tab(QWidget):
 
     def _plot_base_waveforms(self):
         self.canvas.axes.clear()
-        if self.diesel_sample:
+        if self.diesel_sample and self.trace_toggles.is_on("diesel"):
             self.canvas.axes.plot(self.diesel_sample.time, self.diesel_sample.intensity,
                                    label="경유(Diesel)", color="green", alpha=0.7)
-        if self.raw_sample:
+        if self.raw_sample and self.trace_toggles.is_on("raw"):
             self.canvas.axes.plot(self.raw_sample.time, self.raw_sample.intensity,
                                    label="원료(Raw)", color="red", alpha=0.7)
-        if self.fake_sample:
+        if self.fake_sample and self.trace_toggles.is_on("fake"):
             self.canvas.axes.plot(self.fake_sample.time, self.fake_sample.intensity,
                                    label="가짜석유(Fake, 실측)", color="black", linewidth=1.5)
         self.canvas.axes.set_xlabel("Retention Time (min)")
@@ -430,8 +481,10 @@ class Case1Tab(QWidget):
         )
 
         self._plot_base_waveforms()
-        self.canvas.axes.plot(self.diesel_sample.time, est_wave,
-                               label=f"예상 배합 (a={a:.2f})", color="purple", linestyle="--", linewidth=1.8)
+        if self.trace_toggles.is_on("blend"):
+            self.canvas.axes.plot(self.diesel_sample.time, est_wave,
+                                   label=f"예상 배합 (a={a:.2f})", color="purple",
+                                   linestyle="--", linewidth=1.8)
         self.canvas.axes.legend(loc="upper right", fontsize=8)
         self.canvas.draw()
 
@@ -974,6 +1027,7 @@ class Case2Tab(QWidget):
 
         self.diesel_sample: Optional[FuelSample] = None
         self.fake_sample: Optional[FuelSample] = None
+        self._plotted_match = None      # 마지막으로 그린 매칭 결과 (표시 토글 시 다시 그림)
 
         # 원료 후보 DB (영속 저장, 추가/편집/삭제는 DB 관리 창에서).
         # DB 파일을 읽거나 쓸 수 없는 환경(권한이 제한된 PC 등)이어도 앱 자체는
@@ -1092,10 +1146,21 @@ class Case2Tab(QWidget):
         left_widget.setLayout(left_panel)
 
         self.canvas = MplCanvas(self, width=7, height=6)
+        self.trace_toggles = TraceToggleBar([
+            ("diesel", "경유"), ("fake", "가짜석유"),
+            ("candidate", "후보 원료"), ("blend", "예상 배합"),
+        ])
+        self.trace_toggles.changed.connect(self._refresh_plot)
+
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.addWidget(self.canvas, stretch=1)
+        right_layout.addWidget(self.trace_toggles)
 
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(left_widget)
-        splitter.addWidget(self.canvas)
+        splitter.addWidget(right_widget)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         main_layout.addWidget(splitter)
@@ -1131,9 +1196,20 @@ class Case2Tab(QWidget):
         if self.diesel_file_row.get_path() and self.fake_file_row.get_path():
             self.on_load_data()  # 내부에서 DB에 후보가 있으면 매칭까지 자동 실행
 
+    def _refresh_plot(self):
+        """표시할 파형을 바꿨을 때 지금 화면에 맞는 그림을 다시 그린다."""
+        if self._plotted_match is not None:
+            self._plot_match(self._plotted_match)
+        elif self.diesel_sample or self.fake_sample:
+            self._plot_inputs()
+        else:
+            self._redraw_preview()
+
     def _redraw_preview(self):
         self.canvas.axes.clear()
-        for key in ("Diesel", "Fake"):
+        for key, toggle_key in (("Diesel", "diesel"), ("Fake", "fake")):
+            if not self.trace_toggles.is_on(toggle_key):
+                continue
             if key in self._preview_waveforms:
                 t, intensity, color, label = self._preview_waveforms[key]
                 self.canvas.axes.plot(t, intensity, label=label, color=color,
@@ -1147,10 +1223,10 @@ class Case2Tab(QWidget):
 
     def _plot_inputs(self):
         self.canvas.axes.clear()
-        if self.diesel_sample:
+        if self.diesel_sample and self.trace_toggles.is_on("diesel"):
             self.canvas.axes.plot(self.diesel_sample.time, self.diesel_sample.intensity,
                                    label="경유(Diesel)", color="green", alpha=0.7)
-        if self.fake_sample:
+        if self.fake_sample and self.trace_toggles.is_on("fake"):
             self.canvas.axes.plot(self.fake_sample.time, self.fake_sample.intensity,
                                    label="가짜석유(Fake)", color="black", linewidth=1.5)
         self.canvas.axes.set_xlabel("Retention Time (min)")
@@ -1261,15 +1337,19 @@ class Case2Tab(QWidget):
     def _plot_match(self, match):
         """경유/가짜석유/후보 원본 파형 + 최적비율에서의 예상 배합을 함께 표시."""
         cand = match.candidate
+        self._plotted_match = match
         self._plot_inputs()
         if cand is not None:
-            self.canvas.axes.plot(self.diesel_sample.time, cand.intensity,
-                                   label=f"후보: {match.candidate_name}", color="red", alpha=0.6)
-            cand_sample = FuelSample(match.candidate_name, self.diesel_sample.time, cand.intensity, cand.properties)
-            blended, _ = FuelBlendingSimulator(self.diesel_sample, cand_sample).simulate(match.a_optimal)
-            self.canvas.axes.plot(self.diesel_sample.time, blended,
-                                   label=f"예상 배합 (a={match.a_optimal:.2f})",
-                                   color="purple", linestyle="--", linewidth=1.8)
+            if self.trace_toggles.is_on("candidate"):
+                self.canvas.axes.plot(self.diesel_sample.time, cand.intensity,
+                                       label=f"후보: {match.candidate_name}", color="red", alpha=0.6)
+            if self.trace_toggles.is_on("blend"):
+                cand_sample = FuelSample(match.candidate_name, self.diesel_sample.time,
+                                         cand.intensity, cand.properties)
+                blended, _ = FuelBlendingSimulator(self.diesel_sample, cand_sample).simulate(match.a_optimal)
+                self.canvas.axes.plot(self.diesel_sample.time, blended,
+                                       label=f"예상 배합 (a={match.a_optimal:.2f})",
+                                       color="purple", linestyle="--", linewidth=1.8)
         self.canvas.axes.legend(loc="upper right", fontsize=8)
         self.canvas.draw()
 
