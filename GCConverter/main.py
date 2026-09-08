@@ -24,7 +24,18 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from converter import convert_all  # noqa: E402
 
 APP_TITLE = "GC Converter — 크로마토그램 일괄 CSV 변환"
-SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gcconverter_settings.json")
+
+
+def _program_dir() -> str:
+    """설정 파일을 둘 폴더. PyInstaller onefile로 패키징된 경우 sys.executable이
+    (임시 압축해제 폴더가 아니라) 실제 exe가 놓인 위치를 가리키므로 이를 쓰고,
+    스크립트로 직접 실행할 때는 이 파일이 있는 폴더를 쓴다."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+SETTINGS_PATH = os.path.join(_program_dir(), "gcconverter_settings.json")
 
 LEVEL_COLORS = {
     "ok": "#1B7A3D",
