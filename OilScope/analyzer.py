@@ -475,6 +475,11 @@ def _match_percent(final_cost: float, reference_rms: float) -> float:
     return 100.0 * math.exp(-residual / reference_rms)
 
 
+def match_percent_from_cost(final_cost: float, fake_intensity: np.ndarray) -> float:
+    """실측 가짜석유 파형을 기준으로 목적함수 값을 일치율 %로 바꾼다 (Case 1에서도 사용)."""
+    return _match_percent(final_cost, float(np.sqrt(np.mean(np.asarray(fake_intensity) ** 2))))
+
+
 def match_fake_against_candidates(
     diesel: FuelSample,
     fake: FuelSample,

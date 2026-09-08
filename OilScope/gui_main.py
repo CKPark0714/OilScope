@@ -62,11 +62,12 @@ from data_parser import GCDataParser, GCWaveform
 from analyzer import (
     FuelProperties, FuelSample, FuelBlendingSimulator, MixRatioEstimator,
     deconvolve_raw_waveform, estimate_unknown_raw_properties,
-    match_fake_against_candidates, normalize_density_g_cm3,
+    match_fake_against_candidates, match_percent_from_cost, normalize_density_g_cm3,
 )
 from raw_material_db import (
     RawMaterialDatabase, RawMaterialRecord, seed_example_records, import_master_excel,
 )
+import report
 import theme
 
 
@@ -248,6 +249,8 @@ class Case1Tab(QWidget):
         self.raw_sample: Optional[FuelSample] = None
         self.fake_sample: Optional[FuelSample] = None
         self.simulator: Optional[FuelBlendingSimulator] = None
+        self._last_estimate: Optional[dict] = None      # 리포트에 넣을 마지막 역추적 결과
+        self._last_match_percent: float = 0.0
 
         # 파일 선택 즉시 표시용 미리보기 파형 캐시 (이름 -> (time, intensity, color, label))
         self._preview_waveforms: dict = {}
@@ -324,6 +327,16 @@ class Case1Tab(QWidget):
         sim_layout.addWidget(self.sim_props_label)
 
         left_panel.addWidget(sim_group)
+
+        report_row = QHBoxLayout()
+        self.save_report_btn = QPushButton("리포트 저장(PDF)...")
+        self.save_report_btn.clicked.connect(self.on_save_report)
+        self.print_report_btn = QPushButton("리포트 인쇄...")
+        self.print_report_btn.clicked.connect(self.on_print_report)
+        report_row.addWidget(self.save_report_btn)
+        report_row.addWidget(self.print_report_btn)
+        left_panel.addLayout(report_row)
+
         left_panel.addStretch(1)
 
         left_widget = QWidget()
@@ -430,6 +443,79 @@ class Case1Tab(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "오류", f"데이터 로드 중 오류가 발생했습니다:\n{e}")
 
+
+    # -- 리포트 -------------------------------------------------------------
+    def _props_row(self, label, props):
+        return [label, f"{props.marker_conc:.2f}", f"{props.density:.4f}", f"{props.viscosity:.3f}"]
+
+    def _report_parts(self):
+        """지금 화면에 보이는 입력/결과/그래프로 (HTML 생성함수, 그래프 이미지)를 만든다."""
+        if not (self.diesel_sample and self.raw_sample and self.fake_sample):
+            QMessageBox.warning(self, "리포트 불가", "먼저 데이터를 로드해주세요.")
+            return None
+
+        files = report.kv_table_html([
+            ("경유(Diesel) GC 파일", self.diesel_file_row.get_path()),
+            ("원료(Raw) GC 파일", self.raw_file_row.get_path()),
+            ("가짜석유(Fake) GC 파일", self.fake_file_row.get_path()),
+        ])
+
+        props = report.table_html(
+            ["구분", "식별제(mg/L)", "밀도(g/cm3)", "동점도(mm2/s)"],
+            [self._props_row("경유", self.diesel_sample.properties),
+             self._props_row("원료", self.raw_sample.properties),
+             self._props_row("가짜석유(실측)", self.fake_sample.properties)],
+            numeric_from=1)
+
+        blocks = [("입력 파일", files), ("입력 물성치", props)]
+
+        if self._last_estimate:
+            a = self._last_estimate["a_optimal"]
+            blocks.append(("혼합비율 역추적 결과", report.kv_table_html([
+                ("추정 혼합비율", f"경유 {a*100:.2f}% : 원료 {(1-a)*100:.2f}%"),
+                ("일치율", f"{self._last_match_percent:.1f}%"),
+                ("최적화 수렴", "성공" if self._last_estimate["success"] else "실패"),
+            ])))
+
+        a_now = self.ratio_slider.value() / 1000.0
+        if self.simulator:
+            _wave, est = self.simulator.simulate(a_now)
+            measured = self.fake_sample.properties
+            rows = [
+                ["식별제(mg/L)", f"{est.marker_conc:.2f}", f"{measured.marker_conc:.2f}",
+                 f"{est.marker_conc - measured.marker_conc:+.2f}"],
+                ["밀도(g/cm3)", f"{est.density:.4f}", f"{measured.density:.4f}",
+                 f"{est.density - measured.density:+.4f}"],
+                ["동점도(mm2/s)", f"{est.viscosity:.3f}", f"{measured.viscosity:.3f}",
+                 f"{est.viscosity - measured.viscosity:+.3f}"],
+            ]
+            blocks.append((f"예상 물성치 (경유 {a_now*100:.1f}% 배합 기준)",
+                           report.table_html(["항목", "예상값", "실측값", "차이"], rows, numeric_from=1)))
+
+        def html(plot_width, plot_height):
+            return report.build_html(
+                "OilScope 분석 리포트",
+                "Case 1 — 원료를 알고 있을 때 (혼합비율 역추적)",
+                blocks, plot_width=plot_width, plot_height=plot_height,
+                footer="일치율은 실측 파형·물성치를 얼마나 재현했는지를 나타내는 상대 지표입니다.")
+
+        return html, report.figure_to_image(self.canvas.fig)
+
+    def on_save_report(self):
+        parts = self._report_parts()
+        if parts is None:
+            return
+        html, image = parts
+        name = report.default_filename("OilScope_Case1", self.fake_file_row.get_path())
+        path = report.save_pdf(self, html, image, name)
+        if path:
+            QMessageBox.information(self, "저장 완료", f"리포트를 저장했습니다:\n{path}")
+
+    def on_print_report(self):
+        parts = self._report_parts()
+        if parts is not None:
+            report.print_document(self, *parts)
+
     def _plot_base_waveforms(self):
         self.canvas.axes.clear()
         if self.diesel_sample and self.trace_toggles.is_on("diesel"):
@@ -455,9 +541,12 @@ class Case1Tab(QWidget):
             result = estimator.estimate(initial_guess=self.ratio_slider.value() / 1000.0)
 
             a_opt = result["a_optimal"]
+            self._last_estimate = result
+            match_pct = match_percent_from_cost(result["final_cost"], self.fake_sample.intensity)
+            self._last_match_percent = match_pct
             self.estimate_result_label.setText(
                 f"추정 혼합비율: 경유 {a_opt*100:.2f}% : 원료 {(1-a_opt)*100:.2f}%  "
-                f"(수렴={'성공' if result['success'] else '실패'}, cost={result['final_cost']:.3e})"
+                f"(일치율 {match_pct:.1f}%, 수렴={'성공' if result['success'] else '실패'})"
             )
             # 슬라이더를 추정 결과로 이동시켜 시뮬레이션 그래프 동기화
             self.ratio_slider.setValue(int(round(a_opt * 1000)))
@@ -1141,6 +1230,15 @@ class Case2Tab(QWidget):
         manual_layout.addWidget(self.show_manual_btn)
         left_panel.addWidget(manual_group)
 
+        report_row = QHBoxLayout()
+        self.save_report_btn = QPushButton("리포트 저장(PDF)...")
+        self.save_report_btn.clicked.connect(self.on_save_report)
+        self.print_report_btn = QPushButton("리포트 인쇄...")
+        self.print_report_btn.clicked.connect(self.on_print_report)
+        report_row.addWidget(self.save_report_btn)
+        report_row.addWidget(self.print_report_btn)
+        left_panel.addLayout(report_row)
+
         left_panel.addStretch(1)
         left_widget = QWidget()
         left_widget.setLayout(left_panel)
@@ -1220,6 +1318,82 @@ class Case2Tab(QWidget):
         if self._preview_waveforms:
             self.canvas.axes.legend(loc="upper right", fontsize=8)
         self.canvas.draw()
+
+
+    # -- 리포트 -------------------------------------------------------------
+    def _report_parts(self):
+        """입력·매칭 순위표·추정 물성치·화면 그래프로 (HTML 생성함수, 그래프 이미지)를 만든다."""
+        if not (self.diesel_sample and self.fake_sample):
+            QMessageBox.warning(self, "리포트 불가", "먼저 데이터를 로드해주세요.")
+            return None
+        if not self._last_matches:
+            QMessageBox.warning(self, "리포트 불가", "먼저 DB 후보 매칭을 실행해주세요.")
+            return None
+
+        files = report.kv_table_html([
+            ("경유(Diesel) GC 파일", self.diesel_file_row.get_path()),
+            ("가짜석유(Fake) GC 파일", self.fake_file_row.get_path()),
+        ])
+
+        def prop_row(label, props):
+            return [label, f"{props.marker_conc:.2f}", f"{props.density:.4f}", f"{props.viscosity:.3f}"]
+
+        props = report.table_html(
+            ["구분", "식별제(mg/L)", "밀도(g/cm3)", "동점도(mm2/s)"],
+            [prop_row("경유", self.diesel_sample.properties),
+             prop_row("가짜석유(실측)", self.fake_sample.properties)],
+            numeric_from=1)
+
+        headers = [c[0] for c in self.MATCH_COLUMNS]
+        rows = []
+        for row in range(self.result_table.rowCount()):
+            rows.append([self.result_table.item(row, col).text()
+                         if self.result_table.item(row, col) else ""
+                         for col in range(self.result_table.columnCount())])
+        ranking = report.table_html(headers, rows, numeric_from=4)
+
+        best = self._last_matches[0]
+        est = best.estimated_properties
+        measured = self.fake_sample.properties
+        best_rows = [
+            ["식별제(mg/L)", f"{est.marker_conc:.2f}", f"{measured.marker_conc:.2f}",
+             f"{est.marker_conc - measured.marker_conc:+.2f}"],
+            ["밀도(g/cm3)", f"{est.density:.4f}", f"{measured.density:.4f}",
+             f"{est.density - measured.density:+.4f}"],
+            ["동점도(mm2/s)", f"{est.viscosity:.3f}", f"{measured.viscosity:.3f}",
+             f"{est.viscosity - measured.viscosity:+.3f}"],
+        ]
+        best_block = report.kv_table_html([
+            ("가장 유력한 후보", best.candidate_name),
+            ("추정 배합", f"경유 {best.a_optimal*100:.1f}% : 원료 {best.raw_ratio*100:.1f}%"),
+            ("일치율", f"{best.match_percent:.1f}%"),
+        ]) + report.table_html(["항목", "예상값", "실측값", "차이"], best_rows, numeric_from=1)
+
+        def html(plot_width, plot_height):
+            return report.build_html(
+                "OilScope 분석 리포트",
+                "Case 2 — 원료를 모를 때 (DB 후보 매칭)",
+                [("입력 파일", files), ("입력 물성치", props),
+                 ("DB 후보 매칭 순위", ranking), ("최적 후보 상세", best_block)],
+                plot_width=plot_width, plot_height=plot_height,
+                footer="일치율은 후보들 사이의 상대 비교용 지표로, 100%에 가까울수록 실측 파형·물성치를 그대로 재현합니다.")
+
+        return html, report.figure_to_image(self.canvas.fig)
+
+    def on_save_report(self):
+        parts = self._report_parts()
+        if parts is None:
+            return
+        html, image = parts
+        name = report.default_filename("OilScope_Case2", self.fake_file_row.get_path())
+        path = report.save_pdf(self, html, image, name)
+        if path:
+            QMessageBox.information(self, "저장 완료", f"리포트를 저장했습니다:\n{path}")
+
+    def on_print_report(self):
+        parts = self._report_parts()
+        if parts is not None:
+            report.print_document(self, *parts)
 
     def _plot_inputs(self):
         self.canvas.axes.clear()
