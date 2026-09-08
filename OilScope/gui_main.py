@@ -105,6 +105,24 @@ class MplCanvas(FigureCanvasQTAgg):
         self.setParent(parent)
 
 
+# 그래프 범례에 찍히는 이름과 표시 토글 키를 잇는다. 범례를 클릭해서 켜고 끌 때,
+# 그리고 체크박스 상태를 선에 반영할 때 양쪽에서 쓴다.
+_TRACE_LABEL_PREFIXES = (
+    ("경유", "diesel"),
+    ("원료", "raw"),
+    ("가짜석유", "fake"),
+    ("후보", "candidate"),
+    ("예상 배합", "blend"),
+)
+
+
+def _trace_key_from_label(label: str) -> Optional[str]:
+    for prefix, key in _TRACE_LABEL_PREFIXES:
+        if label.startswith(prefix):
+            return key
+    return None
+
+
 class TraceToggleBar(QWidget):
     """그래프에 겹쳐 그릴 파형을 골라 켜고 끄는 체크박스 줄.
 
@@ -132,6 +150,12 @@ class TraceToggleBar(QWidget):
     def is_on(self, key: str) -> bool:
         box = self._boxes.get(key)
         return box.isChecked() if box is not None else True
+
+    def toggle(self, key: str) -> None:
+        """범례를 클릭했을 때처럼 바깥에서 상태를 뒤집는다 (체크박스도 같이 움직인다)."""
+        box = self._boxes.get(key)
+        if box is not None:
+            box.setChecked(not box.isChecked())
 
 
 # ---------------------------------------------------------------------------
@@ -377,7 +401,9 @@ class Case1Tab(QWidget):
             ("diesel", "경유"), ("raw", "원료"),
             ("fake", "가짜석유"), ("blend", "예상 배합"),
         ])
-        self.trace_toggles.changed.connect(self._refresh_plot)
+        self.trace_toggles.changed.connect(self._apply_trace_visibility)
+        self._legend_targets = {}
+        self.canvas.mpl_connect("pick_event", self._on_legend_pick)
 
         right_widget = QWidget()
         right_layout = QVBoxLayout(right_widget)
@@ -403,20 +429,9 @@ class Case1Tab(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "로드 오류", f"'{label}' 파일을 읽는 중 오류:\n{e}")
 
-    def _refresh_plot(self):
-        """표시할 파형을 바꿨을 때 지금 화면에 맞는 그림을 다시 그린다."""
-        if self.simulator:
-            self.on_slider_changed(self.ratio_slider.value())
-        elif self.diesel_sample or self.raw_sample or self.fake_sample:
-            self._plot_base_waveforms()
-        else:
-            self._redraw_preview()
-
     def _redraw_preview(self):
         self.canvas.axes.clear()
-        for key, toggle_key in (("Diesel", "diesel"), ("Raw", "raw"), ("Fake", "fake")):
-            if not self.trace_toggles.is_on(toggle_key):
-                continue
+        for key in ("Diesel", "Raw", "Fake"):
             if key in self._preview_waveforms:
                 t, intensity, color, label = self._preview_waveforms[key]
                 self.canvas.axes.plot(t, intensity, label=label, color=color,
@@ -424,9 +439,7 @@ class Case1Tab(QWidget):
         self.canvas.axes.set_xlabel("Retention Time (min)")
         self.canvas.axes.set_ylabel("Intensity (raw)")
         self.canvas.axes.set_title("입력 데이터 미리보기 (파일 선택 즉시 표시)")
-        if self._preview_waveforms:
-            self.canvas.axes.legend(loc="upper right", fontsize=8)
-        self.canvas.draw()
+        self._apply_trace_visibility()
 
     # ------------------------------------------------------------
     def on_load_data(self):
@@ -545,21 +558,55 @@ class Case1Tab(QWidget):
         if parts is not None:
             report.print_document(self, *parts)
 
+
+    # -- 그래프 표시 토글 -----------------------------------------------------
+    def _apply_trace_visibility(self):
+        """체크 상태에 따라 선을 보였다 감추고, 범례를 클릭할 수 있게 만든다.
+
+        선을 아예 안 그리는 대신 그려두고 숨긴다. 그래야 꺼진 파형도 범례에 남아
+        (흐리게 표시) 다시 클릭해서 켤 수 있고, 축 범위도 흔들리지 않는다.
+        """
+        for line in self.canvas.axes.get_lines():
+            key = _trace_key_from_label(str(line.get_label()))
+            if key:
+                line.set_visible(self.trace_toggles.is_on(key))
+
+        legend = self.canvas.axes.legend(loc="upper right", fontsize=8)
+        self._legend_targets = {}
+        if legend is not None:
+            legend.set_draggable(True)
+            for text, marker in zip(legend.get_texts(), legend.get_lines()):
+                key = _trace_key_from_label(text.get_text())
+                if not key:
+                    continue
+                on = self.trace_toggles.is_on(key)
+                text.set_alpha(1.0 if on else 0.35)
+                marker.set_alpha(1.0 if on else 0.25)
+                for artist in (text, marker):
+                    artist.set_picker(True)
+                    self._legend_targets[artist] = key
+        self.canvas.draw()
+
+    def _on_legend_pick(self, event):
+        """범례의 시료 이름을 클릭하면 그 파형만 껐다 켠다."""
+        key = self._legend_targets.get(event.artist)
+        if key:
+            self.trace_toggles.toggle(key)
+
     def _plot_base_waveforms(self):
         self.canvas.axes.clear()
-        if self.diesel_sample and self.trace_toggles.is_on("diesel"):
+        if self.diesel_sample:
             self.canvas.axes.plot(self.diesel_sample.time, self.diesel_sample.intensity,
                                    label="경유(Diesel)", color="green", alpha=0.7)
-        if self.raw_sample and self.trace_toggles.is_on("raw"):
+        if self.raw_sample:
             self.canvas.axes.plot(self.raw_sample.time, self.raw_sample.intensity,
                                    label="원료(Raw)", color="red", alpha=0.7)
-        if self.fake_sample and self.trace_toggles.is_on("fake"):
+        if self.fake_sample:
             self.canvas.axes.plot(self.fake_sample.time, self.fake_sample.intensity,
                                    label="가짜석유(Fake, 실측)", color="black", linewidth=1.5)
         self.canvas.axes.set_xlabel("Retention Time (min)")
         self.canvas.axes.set_ylabel("Normalized Intensity")
-        self.canvas.axes.legend(loc="upper right", fontsize=8)
-        self.canvas.draw()
+        self._apply_trace_visibility()
 
     def on_estimate_ratio(self):
         if not (self.diesel_sample and self.raw_sample and self.fake_sample):
@@ -599,12 +646,10 @@ class Case1Tab(QWidget):
         )
 
         self._plot_base_waveforms()
-        if self.trace_toggles.is_on("blend"):
-            self.canvas.axes.plot(self.diesel_sample.time, est_wave,
-                                   label=f"예상 배합 (a={a:.2f})", color="purple",
-                                   linestyle="--", linewidth=1.8)
-        self.canvas.axes.legend(loc="upper right", fontsize=8)
-        self.canvas.draw()
+        self.canvas.axes.plot(self.diesel_sample.time, est_wave,
+                               label=f"예상 배합 (a={a:.2f})", color="purple",
+                               linestyle="--", linewidth=1.8)
+        self._apply_trace_visibility()
 
 
 # ---------------------------------------------------------------------------
@@ -1145,7 +1190,6 @@ class Case2Tab(QWidget):
 
         self.diesel_sample: Optional[FuelSample] = None
         self.fake_sample: Optional[FuelSample] = None
-        self._plotted_match = None      # 마지막으로 그린 매칭 결과 (표시 토글 시 다시 그림)
 
         # 원료 후보 DB (영속 저장, 추가/편집/삭제는 DB 관리 창에서).
         # DB 파일을 읽거나 쓸 수 없는 환경(권한이 제한된 PC 등)이어도 앱 자체는
@@ -1285,7 +1329,9 @@ class Case2Tab(QWidget):
             ("diesel", "경유"), ("fake", "가짜석유"),
             ("candidate", "후보 원료"), ("blend", "예상 배합"),
         ])
-        self.trace_toggles.changed.connect(self._refresh_plot)
+        self.trace_toggles.changed.connect(self._apply_trace_visibility)
+        self._legend_targets = {}
+        self.canvas.mpl_connect("pick_event", self._on_legend_pick)
 
         right_widget = QWidget()
         right_layout = QVBoxLayout(right_widget)
@@ -1331,20 +1377,9 @@ class Case2Tab(QWidget):
         if self.diesel_file_row.get_path() and self.fake_file_row.get_path():
             self.on_load_data()  # 내부에서 DB에 후보가 있으면 매칭까지 자동 실행
 
-    def _refresh_plot(self):
-        """표시할 파형을 바꿨을 때 지금 화면에 맞는 그림을 다시 그린다."""
-        if self._plotted_match is not None:
-            self._plot_match(self._plotted_match)
-        elif self.diesel_sample or self.fake_sample:
-            self._plot_inputs()
-        else:
-            self._redraw_preview()
-
     def _redraw_preview(self):
         self.canvas.axes.clear()
-        for key, toggle_key in (("Diesel", "diesel"), ("Fake", "fake")):
-            if not self.trace_toggles.is_on(toggle_key):
-                continue
+        for key in ("Diesel", "Fake"):
             if key in self._preview_waveforms:
                 t, intensity, color, label = self._preview_waveforms[key]
                 self.canvas.axes.plot(t, intensity, label=label, color=color,
@@ -1352,9 +1387,7 @@ class Case2Tab(QWidget):
         self.canvas.axes.set_xlabel("Retention Time (min)")
         self.canvas.axes.set_ylabel("Intensity (raw)")
         self.canvas.axes.set_title("입력 데이터 미리보기 (파일 선택 즉시 표시)")
-        if self._preview_waveforms:
-            self.canvas.axes.legend(loc="upper right", fontsize=8)
-        self.canvas.draw()
+        self._apply_trace_visibility()
 
 
     # -- 리포트 -------------------------------------------------------------
@@ -1435,18 +1468,52 @@ class Case2Tab(QWidget):
         if parts is not None:
             report.print_document(self, *parts)
 
+
+    # -- 그래프 표시 토글 -----------------------------------------------------
+    def _apply_trace_visibility(self):
+        """체크 상태에 따라 선을 보였다 감추고, 범례를 클릭할 수 있게 만든다.
+
+        선을 아예 안 그리는 대신 그려두고 숨긴다. 그래야 꺼진 파형도 범례에 남아
+        (흐리게 표시) 다시 클릭해서 켤 수 있고, 축 범위도 흔들리지 않는다.
+        """
+        for line in self.canvas.axes.get_lines():
+            key = _trace_key_from_label(str(line.get_label()))
+            if key:
+                line.set_visible(self.trace_toggles.is_on(key))
+
+        legend = self.canvas.axes.legend(loc="upper right", fontsize=8)
+        self._legend_targets = {}
+        if legend is not None:
+            legend.set_draggable(True)
+            for text, marker in zip(legend.get_texts(), legend.get_lines()):
+                key = _trace_key_from_label(text.get_text())
+                if not key:
+                    continue
+                on = self.trace_toggles.is_on(key)
+                text.set_alpha(1.0 if on else 0.35)
+                marker.set_alpha(1.0 if on else 0.25)
+                for artist in (text, marker):
+                    artist.set_picker(True)
+                    self._legend_targets[artist] = key
+        self.canvas.draw()
+
+    def _on_legend_pick(self, event):
+        """범례의 시료 이름을 클릭하면 그 파형만 껐다 켠다."""
+        key = self._legend_targets.get(event.artist)
+        if key:
+            self.trace_toggles.toggle(key)
+
     def _plot_inputs(self):
         self.canvas.axes.clear()
-        if self.diesel_sample and self.trace_toggles.is_on("diesel"):
+        if self.diesel_sample:
             self.canvas.axes.plot(self.diesel_sample.time, self.diesel_sample.intensity,
                                    label="경유(Diesel)", color="green", alpha=0.7)
-        if self.fake_sample and self.trace_toggles.is_on("fake"):
+        if self.fake_sample:
             self.canvas.axes.plot(self.fake_sample.time, self.fake_sample.intensity,
                                    label="가짜석유(Fake)", color="black", linewidth=1.5)
         self.canvas.axes.set_xlabel("Retention Time (min)")
         self.canvas.axes.set_ylabel("Normalized Intensity")
-        self.canvas.axes.legend(loc="upper right", fontsize=8)
-        self.canvas.draw()
+        self._apply_trace_visibility()
 
     def on_slider_changed(self, value: int):
         a = value / 1000.0
@@ -1551,21 +1618,17 @@ class Case2Tab(QWidget):
     def _plot_match(self, match):
         """경유/가짜석유/후보 원본 파형 + 최적비율에서의 예상 배합을 함께 표시."""
         cand = match.candidate
-        self._plotted_match = match
         self._plot_inputs()
         if cand is not None:
-            if self.trace_toggles.is_on("candidate"):
-                self.canvas.axes.plot(self.diesel_sample.time, cand.intensity,
-                                       label=f"후보: {match.candidate_name}", color="red", alpha=0.6)
-            if self.trace_toggles.is_on("blend"):
-                cand_sample = FuelSample(match.candidate_name, self.diesel_sample.time,
-                                         cand.intensity, cand.properties)
-                blended, _ = FuelBlendingSimulator(self.diesel_sample, cand_sample).simulate(match.a_optimal)
-                self.canvas.axes.plot(self.diesel_sample.time, blended,
-                                       label=f"예상 배합 (a={match.a_optimal:.2f})",
-                                       color="purple", linestyle="--", linewidth=1.8)
-        self.canvas.axes.legend(loc="upper right", fontsize=8)
-        self.canvas.draw()
+            self.canvas.axes.plot(self.diesel_sample.time, cand.intensity,
+                                   label=f"후보: {match.candidate_name}", color="red", alpha=0.6)
+            cand_sample = FuelSample(match.candidate_name, self.diesel_sample.time,
+                                     cand.intensity, cand.properties)
+            blended, _ = FuelBlendingSimulator(self.diesel_sample, cand_sample).simulate(match.a_optimal)
+            self.canvas.axes.plot(self.diesel_sample.time, blended,
+                                   label=f"예상 배합 (a={match.a_optimal:.2f})",
+                                   color="purple", linestyle="--", linewidth=1.8)
+        self._apply_trace_visibility()
 
     def on_show_match_detail(self):
         rows = self.result_table.selectionModel().selectedRows() if self.result_table.selectionModel() else []
