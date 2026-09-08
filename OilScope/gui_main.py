@@ -40,20 +40,41 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 from matplotlib import font_manager, rcParams
 
-# --- Matplotlib 한글 폰트 설정 (Windows) ---
-# 기본 폰트(DejaVu Sans)에는 한글이 없어 범례/제목이 깨지므로,
-# 시스템에 설치된 한글 폰트(맑은 고딕 등)를 자동으로 찾아 적용한다.
+# --- Matplotlib 한글 폰트 설정 ---
+# 기본 폰트(DejaVu Sans)에는 한글이 없어 범례/제목이 네모로 깨지므로, 시스템에
+# 설치된 한글 폰트를 찾아 적용한다. 이름이 OS마다 달라 목록을 넉넉히 두고, 그래도
+# 못 찾으면 설치된 폰트를 열어 한글 글리프가 있는 것을 직접 고른다 - 이 그림은
+# 리포트로도 인쇄되므로 깨진 채로 넘어가면 그대로 종이에 남는다.
+_KOREAN_FONTS = [
+    "Malgun Gothic", "맑은 고딕", "Gulim", "Dotum", "Batang",       # Windows
+    "Apple SD Gothic Neo", "AppleGothic", "Apple Gothic",           # macOS
+    "NanumGothic", "Nanum Gothic", "NanumBarunGothic",              # 나눔
+    "Noto Sans CJK KR", "Noto Sans KR", "Source Han Sans KR",       # 공용
+]
+
+
+def _font_with_hangul():
+    """설치된 폰트 중 한글('가')을 그릴 수 있는 첫 번째 폰트 이름."""
+    for entry in font_manager.fontManager.ttflist:
+        try:
+            if font_manager.get_font(entry.fname).get_char_index(ord("가")):
+                return entry.name
+        except Exception:  # noqa: BLE001 - 읽을 수 없는 폰트는 그냥 건너뛴다
+            continue
+    return None
+
+
 def _setup_korean_font():
-    preferred = ["Malgun Gothic", "맑은 고딕", "NanumGothic", "Gulim", "Dotum", "Batang"]
     available = {f.name for f in font_manager.fontManager.ttflist}
-    for name in preferred:
-        if name in available:
-            rcParams["font.family"] = name
-            break
+    chosen = next((name for name in _KOREAN_FONTS if name in available), None)
+    if chosen is None:
+        chosen = _font_with_hangul()
+
+    if chosen:
+        rcParams["font.family"] = chosen
     else:
-        # 못 찾으면 sans-serif 후보 중 한글 지원 가능성이 있는 것으로 폴백
         rcParams["font.family"] = "sans-serif"
-        rcParams["font.sans-serif"] = preferred + rcParams.get("font.sans-serif", [])
+        rcParams["font.sans-serif"] = _KOREAN_FONTS + rcParams.get("font.sans-serif", [])
     rcParams["axes.unicode_minus"] = False  # 한글 폰트에서 마이너스 부호 깨짐 방지
 
 _setup_korean_font()
@@ -1360,13 +1381,16 @@ class Case2Tab(QWidget):
              prop_row("가짜석유(실측)", self.fake_sample.properties)],
             numeric_from=1)
 
-        headers = [c[0] for c in self.MATCH_COLUMNS]
+        # 종이에서는 폭이 빠듯해 머리글을 줄이고 열 폭을 고정한다
+        headers = ["순위", "시료번호", "원료명", "유종", "경유비율", "원료비율",
+                   "일치율", "파형유사도", "식별제", "밀도", "동점도"]
+        widths = [4, 13, 15, 8, 9, 9, 8, 9, 8, 8, 9]
         rows = []
         for row in range(self.result_table.rowCount()):
             rows.append([self.result_table.item(row, col).text()
                          if self.result_table.item(row, col) else ""
                          for col in range(self.result_table.columnCount())])
-        ranking = report.table_html(headers, rows, numeric_from=4)
+        ranking = report.table_html(headers, rows, numeric_from=4, widths=widths)
 
         best = self._last_matches[0]
         est = best.estimated_properties
