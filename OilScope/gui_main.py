@@ -953,6 +953,21 @@ class RawMaterialDBDialog(QDialog):
 # 탭 2: Case 2 - 미지 원료 추정 & DB 탐색
 # ---------------------------------------------------------------------------
 class Case2Tab(QWidget):
+    # (헤더, 기본 폭) - 폭은 처음 표시용이고, 사용자가 경계선을 끌어 바꿀 수 있다.
+    MATCH_COLUMNS = [
+        ("순위", 46),
+        ("시료번호", 120),
+        ("원료명", 170),
+        ("유종", 80),
+        ("추정 경유비율", 105),
+        ("추정 원료비율", 105),
+        ("일치율", 90),
+        ("파형 유사도", 95),
+        ("등록 식별제(mg/L)", 130),
+        ("등록 밀도(g/cm3)", 125),
+        ("등록 동점도(mm2/s)", 140),
+    ]
+
     def __init__(self, parser: GCDataParser, parent=None):
         super().__init__(parent)
         self.parser = parser
@@ -1027,10 +1042,19 @@ class Case2Tab(QWidget):
         self.match_btn.clicked.connect(self.on_match_candidates)
         match_layout.addWidget(self.match_btn)
 
-        self.result_table = QTableWidget(0, 4)
-        self.result_table.setHorizontalHeaderLabels(["순위", "원료명", "추정 경유비율", "재구성오차"])
-        self.result_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        # 열이 화면보다 넓어도 되도록 Stretch 대신 Interactive를 쓴다 - 가로로
+        # 밀어 보면서 등록 물성치까지 확인할 수 있고, 경계선을 끌어 폭도 바꿀 수 있다.
+        self.result_table = QTableWidget(0, len(self.MATCH_COLUMNS))
+        self.result_table.setHorizontalHeaderLabels([c[0] for c in self.MATCH_COLUMNS])
+        header = self.result_table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.Interactive)
+        header.setStretchLastSection(False)
+        for col, (_label, width) in enumerate(self.MATCH_COLUMNS):
+            self.result_table.setColumnWidth(col, width)
+        self.result_table.setHorizontalScrollMode(QTableWidget.ScrollPerPixel)
         self.result_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.result_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.result_table.setMinimumHeight(210)
         self.result_table.itemDoubleClicked.connect(lambda _: self.on_show_match_detail())
         match_layout.addWidget(self.result_table)
 
@@ -1197,10 +1221,26 @@ class Case2Tab(QWidget):
 
         self.result_table.setRowCount(len(matches))
         for row, m in enumerate(matches):
-            self.result_table.setItem(row, 0, QTableWidgetItem(str(row + 1)))
-            self.result_table.setItem(row, 1, QTableWidgetItem(m.candidate_name))
-            self.result_table.setItem(row, 2, QTableWidgetItem(f"{m.a_optimal*100:.1f}%"))
-            self.result_table.setItem(row, 3, QTableWidgetItem(f"{m.final_cost:.3e}"))
+            cand = m.candidate
+            props = cand.properties if cand else None
+            values = [
+                str(row + 1),
+                (cand.sample_no if cand else "") or "",
+                (cand.material_name if cand else "") or m.candidate_name,
+                (cand.oil_type if cand else "") or "",
+                f"{m.a_optimal*100:.1f}%",
+                f"{m.raw_ratio*100:.1f}%",
+                f"{m.match_percent:.1f}%",
+                f"{m.wave_similarity:.4f}",
+                f"{props.marker_conc:.2f}" if props else "",
+                f"{props.density:.4f}" if props else "",
+                f"{props.viscosity:.3f}" if props else "",
+            ]
+            for col, v in enumerate(values):
+                item = QTableWidgetItem(v)
+                if col == 0 or col >= 4:
+                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                self.result_table.setItem(row, col, item)
         self.show_detail_btn.setEnabled(bool(matches))
 
         if matches:
@@ -1210,7 +1250,7 @@ class Case2Tab(QWidget):
             QMessageBox.information(
                 self, "매칭 완료",
                 f"최적 후보: {best.candidate_name} (경유 {best.a_optimal*100:.1f}%, "
-                f"재구성오차 {best.final_cost:.3e})\n"
+                f"일치율 {best.match_percent:.1f}%)\n"
                 f"추정 원료 물성치 — 식별제: {best.estimated_properties.marker_conc:.2f} mg/L, "
                 f"밀도: {best.estimated_properties.density:.4f} g/cm3, "
                 f"동점도: {best.estimated_properties.viscosity:.3f} mm2/s"
@@ -1263,7 +1303,7 @@ class Case2Tab(QWidget):
         canvas.axes.set_xlabel("Retention Time (min)")
         canvas.axes.set_ylabel("Normalized Intensity")
         canvas.axes.set_title(f"경유 {match.a_optimal*100:.1f}% : {match.candidate_name} "
-                               f"{match.raw_ratio*100:.1f}% — 재구성오차 {match.final_cost:.3e}")
+                               f"{match.raw_ratio*100:.1f}% — 일치율 {match.match_percent:.1f}%")
         canvas.axes.legend(loc="upper right", fontsize=9)
         canvas.draw()
         layout.addWidget(canvas)

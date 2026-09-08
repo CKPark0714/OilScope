@@ -233,14 +233,20 @@ class RawMaterialDatabase:
                 name=self._display_name(r),
                 intensity=normalized,
                 properties=r.properties,
+                sample_no=r.sample_no,
+                material_name=r.name,
+                oil_type=r.oil_type,
             ))
         return candidates
 
     @staticmethod
     def _display_name(r: "RawMaterialRecord") -> str:
-        parts = [p for p in (r.oil_type, r.sample_no) if p]
-        suffix = f" ({'/'.join(parts)})" if parts else ""
-        return f"{r.name}{suffix}" if r.name else (r.sample_no or r.id)
+        """그래프 범례·안내창에 쓰는 한 줄 표기. 현장에서 후보를 가리키는 기준은
+        원료명이 아니라 시료번호(의뢰번호)라서 시료번호를 앞에 둔다."""
+        head = " · ".join(p for p in (r.sample_no, r.name) if p)
+        if not head:
+            return r.id
+        return f"{head} ({r.oil_type})" if r.oil_type else head
 
 
 def seed_example_records(db: RawMaterialDatabase) -> None:

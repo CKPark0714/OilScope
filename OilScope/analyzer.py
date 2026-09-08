@@ -31,6 +31,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Sequence, Tuple
 
+import math
+
 import numpy as np
 from scipy.optimize import minimize
 from sklearn.metrics.pairwise import cosine_similarity
@@ -65,9 +67,13 @@ class FuelSample:
 class RawMaterialCandidate:
     """원료 DB에 등록된 후보 원료 (Case 2 유사도 탐색용)."""
 
-    name: str
+    name: str                            # 화면 표기용 이름 (시료번호를 앞세운 라벨)
     intensity: np.ndarray                # 기준 시간축에 맞춰 리샘플링/정규화된 파형
     properties: FuelProperties = field(default_factory=FuelProperties)
+    # 아래 세 가지는 결과 표에서 열을 나눠 보여주기 위해 원본 레코드에서 그대로 옮겨온다.
+    sample_no: str = ""
+    material_name: str = ""
+    oil_type: str = ""
 
 
 @dataclass
@@ -92,6 +98,7 @@ class CandidateMatchResult:
     estimated_properties: FuelProperties
     wave_similarity: float               # 참고용 코사인 유사도 (최적 a에서의 예상 파형 vs 실측 가짜석유)
     candidate: "RawMaterialCandidate" = None   # 원본 후보 객체 (이름이 중복돼도 정확히 식별하기 위함)
+    match_percent: float = 0.0           # 화면 표기용 일치율 % (final_cost를 실측 신호 크기로 정규화)
 
 
 # ---------------------------------------------------------------------------
@@ -452,6 +459,22 @@ def search_similar_raw_materials(
     return results[:top_n]
 
 
+def _match_percent(final_cost: float, reference_rms: float) -> float:
+    """목적함수 값을 0~100% 일치율로 바꾼다.
+
+    100%는 실측 가짜석유의 파형·물성치가 그대로 재현됐다는 뜻이다. 잔차를
+    reference_rms(실측 파형의 RMS)로 정규화하므로 시료 크기가 달라도 서로 비교할 수
+    있고, final_cost에 대해 단조감소라 순위와 표기가 어긋나지 않는다. 절대 점수가
+    아니라 후보들 사이의 상대 비교용 수치다.
+    """
+    if reference_rms <= 0:
+        return 0.0
+    residual = math.sqrt(max(final_cost, 0.0))
+    # 선형으로 (1 - 잔차/신호크기)를 쓰면 잘 안 맞는 후보들이 전부 0%로 뭉쳐
+    # 서로 구분이 안 된다. 지수 감쇠를 쓰면 0%로 붙지 않으면서 순위 간격이 벌어진다.
+    return 100.0 * math.exp(-residual / reference_rms)
+
+
 def match_fake_against_candidates(
     diesel: FuelSample,
     fake: FuelSample,
@@ -500,6 +523,13 @@ def match_fake_against_candidates(
             wave_similarity=wave_sim,
             candidate=cand,
         ))
+
+    # 목적함수 값(final_cost)은 단위가 없고 자릿수도 작아 그대로 보여주면 읽기 어렵다.
+    # 잔차(sqrt(cost))를 실측 가짜석유 파형의 크기로 나눠 "얼마나 안 맞았는지" 비율로
+    # 바꾼 뒤 100%에서 뺀다 - final_cost에 대해 단조감소라 순위는 그대로 유지된다.
+    ref = float(np.sqrt(np.mean(fake.intensity ** 2)))
+    for r in results:
+        r.match_percent = _match_percent(r.final_cost, ref)
 
     results.sort(key=lambda r: r.final_cost)
     return results[:top_n]
