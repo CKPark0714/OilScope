@@ -1,0 +1,37 @@
+name: Build GCConverter Windows EXE
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [main]
+    paths:
+      - "GCConverter/**"
+      - ".github/workflows/build-gcconverter-exe.yml"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: GCConverter
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build (onedir + zip)
+        run: python build_exe.py
+
+      - name: Upload distributable zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: GCConverter-windows
+          path: GCConverter/dist/GCConverter-windows.zip
+          if-no-files-found: error

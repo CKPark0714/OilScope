@@ -1,0 +1,4 @@
+rainbow-api
+numpy
+lxml
+pyinstaller
